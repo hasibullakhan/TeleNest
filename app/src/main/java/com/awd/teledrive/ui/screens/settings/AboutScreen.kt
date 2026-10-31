@@ -232,9 +232,9 @@ fun AboutScreen(
             SettingsClickableRow(
                 icon = Icons.Default.Code,
                 title = stringResource(R.string.github_and_issues),
-                subtitle = "github.com/Hasibulla-Khan/TeleNest",
+                subtitle = "github.com/hasibullakhan/TeleNest",
                 onClick = {
-                    val intent = Intent(Intent.ACTION_VIEW, "https://github.com/Hasibulla-Khan/TeleNest".toUri())
+                    val intent = Intent(Intent.ACTION_VIEW, "https://github.com/hasibullakhan/TeleNest".toUri())
                     context.startActivity(intent)
                 }
             )

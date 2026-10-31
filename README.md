@@ -6,15 +6,15 @@
 
 **A Native, Privacy-First Unlimited Cloud Drive for Android Powered by Telegram MTProto & TDLib**
 
-[![Latest Release](https://img.shields.io/github/v/release/Hasibulla-Khan/TeleNest?style=for-the-badge&logo=github&color=0088CC)](https://github.com/Hasibulla-Khan/TeleNest/releases/latest)
-[![Download APK](https://img.shields.io/badge/Download-APK%20v3.0.8-24A1DE?style=for-the-badge&logo=android&logoColor=white)](https://github.com/Hasibulla-Khan/TeleNest/releases/latest/download/TeleNest-v3.0.8.apk)
+[![Latest Release](https://img.shields.io/github/v/release/hasibullakhan/TeleNest?style=for-the-badge&logo=github&color=0088CC)](https://github.com/hasibullakhan/TeleNest/releases/latest)
+[![Download APK](https://img.shields.io/badge/Download-APK%20v3.1.0-24A1DE?style=for-the-badge&logo=android&logoColor=white)](https://github.com/hasibullakhan/TeleNest/releases/latest/download/TeleNest-v3.1.0.apk)
 [![Platform](https://img.shields.io/badge/Platform-Android%207.0%2B%20(API%2024%2B)-3DDC84?style=for-the-badge&logo=android&logoColor=white)](https://developer.android.com)
 [![Kotlin](https://img.shields.io/badge/Kotlin-2.0-7F52FF?style=for-the-badge&logo=kotlin&logoColor=white)](https://kotlinlang.org)
 [![Jetpack Compose](https://img.shields.io/badge/UI-Jetpack%20Compose%20M3-4285F4?style=for-the-badge&logo=jetpackcompose&logoColor=white)](https://developer.android.com/jetpack/compose)
-[![Encryption](https://img.shields.io/badge/Security-AES--256--GCM%20%7C%20Argon2-E11D48?style=for-the-badge&logo=shield&logoColor=white)](https://github.com/Hasibulla-Khan/TeleNest)
+[![Encryption](https://img.shields.io/badge/Security-AES--256--GCM%20%7C%20Argon2-E11D48?style=for-the-badge&logo=shield&logoColor=white)](https://github.com/hasibullakhan/TeleNest)
 [![License: MIT](https://img.shields.io/badge/License-MIT-F59E0B?style=for-the-badge)](LICENSE)
 
-[**Download Latest APK (v3.0.8)**](https://github.com/Hasibulla-Khan/TeleNest/releases/latest) • [**Full Feature Guide**](#-detailed-features--capabilities) • [**Report a Bug**](https://github.com/Hasibulla-Khan/TeleNest/issues) • [**Request a Feature**](https://github.com/Hasibulla-Khan/TeleNest/issues) • [**Author Profile**](https://www.facebook.com/HasibullaKhanHK)
+[**Download Latest APK (v3.1.0)**](https://github.com/hasibullakhan/TeleNest/releases/latest) • [**Full Feature Guide**](#-detailed-features--capabilities) • [**Report a Bug**](https://github.com/hasibullakhan/TeleNest/issues) • [**Request a Feature**](https://github.com/hasibullakhan/TeleNest/issues) • [**Author Profile**](https://www.facebook.com/HasibullaKhanHK)
 
 </div>
 
@@ -35,7 +35,8 @@ Unlike third-party bots, web wrappers, or cloud middleman services that risk you
 | ☁️ **Cloud Storage** | 100% Free, Unlimited Storage, No Subscription, Original File Quality, Auto-Split for >2GB Files |
 | 📁 **Drive Experience** | Unlimited Nested Folders, 24 Custom Colors, Grid & List Layouts, Scroll State Memory, Home Screen Pinning |
 | 🔒 **Privacy & Vault** | Client-Side E2EE (AES-256-GCM / Argon2), SQLCipher Encrypted Database, Biometric & PIN Lock |
-| ⚡ **Transfer Engine** | Native Foreground Service, Pause/Resume/Cancel, Background Photo/Video Auto-Backup via WorkManager |
+| ⚡ **Transfer Engine** | Native Foreground Service, Pause/Resume/Cancel, Byte-accurate Progress Gauges |
+| 🔄 **AutoSync & Folder Pairs** | Full AutoSync Engine (Two-way, Upload only, Upload & delete, Mirror, Download), Instant Upload, File Filters |
 | 🎬 **Built-in Media** | Media3 (ExoPlayer) Video Streaming with Gestures, Background Audio Player, PDF Reader, Code Editor, APK Installer |
 | 🔍 **Search & Sorting** | Real-time Search, Smart Filter Chips (Photos, Videos, Audio, Docs, APKs), Multi-attribute Sorting |
 | 🗑️ **Recycle Bin** | 30-Day Trash Grace Period, One-Tap Exact Path Restoration, Permanent Deletion |
@@ -83,12 +84,29 @@ Unlike third-party bots, web wrappers, or cloud middleman services that risk you
 - **Foreground Transfer Service:** Heavy multi-file uploads and downloads run reliably through an Android Foreground Service equipped with persistent status bar notifications, live transfer speed gauges, and byte-level progress bars.
 - **Pause, Resume & Cancel Controls:** Pause any active transfer, resume interrupted downloads without losing progress, or cancel individual transfers.
 - **Dedicated Transfer Center:** Centralized screen inside the navigation drawer showing **Active**, **Completed**, and **Failed** transfers, complete with retry actions and clear options.
-- **Automated Background Camera Backup:** Automatically detects and uploads newly captured camera photos and videos (`DCIM/Camera`, `Pictures`, `Download`) in the background using Android **WorkManager**. Includes options for **Wi-Fi Only** and **Charging Only** triggers to preserve battery and mobile data.
 - **Cloud Metadata Backup & History:** Automatically mirrors your virtual folder trees, starred lists, and color manifests to the cloud, allowing one-tap restoration on new devices.
 
 ---
 
-### 🎬 5. Built-in Media Players & Document Viewers
+### 🔄 5. Advanced AutoSync & Folder Pairs Engine
+TeleNest features a full-fledged folder synchronization engine inspired by AutoSync, allowing you to pair any local phone directory (or entire internal storage) with any Telegram cloud folder:
+- **5 Versatile Sync Methods:**
+  - 🔄 **Two-way sync:** Keeps device and cloud folders in sync. New/updated files transfer both ways, deletions propagate seamlessly.
+  - ⬆️ **Upload only:** Uploads new/modified local files to the cloud. Deletions on device are preserved in cloud.
+  - 📦 **Upload then delete:** Uploads new files and safely deletes local copies to free up internal phone storage.
+  - 🪞 **Mirror:** Cloud is an exact mirror of local folder. Any files removed locally are removed from cloud.
+  - ⬇️ **Download:** Downloads new cloud files to local device.
+- **Instant Upload & Real-time File Observers:** Detects new photos, recordings, or downloads immediately upon saving and syncs without delay.
+- **Granular Filter & Safety Controls:**
+  - Exclude hidden files & folders (`.nomedia`, dotfiles).
+  - Exclude subfolders or auto-sync all subdirectories recursively.
+  - Delete empty subfolders automatically after synchronization.
+  - Filter by file name or extension (e.g. `*.jpg`, `*.pdf`, `*.mp4`).
+- **Flexible Network & Power Conditions:** Configurable sync triggers for **Wi-Fi only**, **Charging only**, battery level constraints, and custom sync intervals (from 5 minutes to daily).
+
+---
+
+### 🎬 6. Built-in Media Players & Document Viewers
 - **ExoPlayer Video Streaming (AndroidX Media3):** Stream high-definition videos directly from Telegram's cloud without waiting for full downloads. Includes touch gestures (swipe for brightness and volume, double-tap to seek), Picture-in-Picture (PiP) support, playback speed controls (0.25x – 2.0x), and aspect ratio toggles.
 - **Integrated Background Audio Player:** Plays music and audio tracks with background playback, lock screen media controls, playlist queues, and audio scrubbers.
 - **Pinch-to-Zoom Image Gallery:** High-performance photo viewer powered by **Coil** with multi-touch zoom, pan gestures, EXIF metadata inspection (camera model, aperture, ISO, timestamp), and instant sharing.
@@ -142,7 +160,7 @@ Unlike third-party bots, web wrappers, or cloud middleman services that risk you
 ---
 
 ### 🔄 10. Direct In-App Auto-Updater
-- **GitHub Releases Integration:** Built-in repository update engine that queries the GitHub Releases API (`api.github.com/repos/Hasibulla-Khan/TeleNest/releases/latest`).
+- **GitHub Releases Integration:** Built-in repository update engine that queries the GitHub Releases API (`api.github.com/repos/hasibullakhan/TeleNest/releases/latest`).
 - **One-Tap Update Flow:** Displays changelog notes, version numbers, and file sizes directly in-app.
 - **Native Package Installer:** Downloads the release APK into secure cache and invokes Android's `PackageInstaller` for a frictionless update experience without requiring manual browser downloads.
 
@@ -248,7 +266,7 @@ TeleNest follows Google's recommended **Clean Architecture** and **Modern Androi
 
 1. **Clone the Repository:**
    ```bash
-   git clone https://github.com/Hasibulla-Khan/TeleNest.git
+   git clone https://github.com/hasibullakhan/TeleNest.git
    cd TeleNest
    ```
 
@@ -282,7 +300,7 @@ TeleNest follows Google's recommended **Clean Architecture** and **Modern Androi
 
 **Hasibulla Khan**
 - 🌐 **Facebook:** [facebook.com/HasibullaKhanHK](https://www.facebook.com/HasibullaKhanHK)
-- 🐙 **GitHub:** [@Hasibulla-Khan](https://github.com/Hasibulla-Khan)
+- 🐙 **GitHub:** [@hasibullakhan](https://github.com/hasibullakhan)
 - 📧 **Contact:** `hasibullakhanhk@gmail.com`
 
 ---

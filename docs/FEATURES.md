@@ -198,7 +198,7 @@ TeleNest uses a dual-folder model:
 
 ## 10. In-App Auto-Update Architecture
 
-- Connected directly to the GitHub Releases API (`/repos/Hasibulla-Khan/TeleNest/releases/latest`).
+- Connected directly to the GitHub Releases API (`/repos/hasibullakhan/TeleNest/releases/latest`).
 - Automated startup checks and manual checks under **Settings → About**.
 - In-app download with native package installation.
 
