@@ -1,0 +1,1136 @@
+package com.awd.teledrive.ui.screens.settings
+
+import android.widget.Toast
+import androidx.activity.compose.rememberLauncherForActivityResult
+import androidx.activity.result.contract.ActivityResultContracts
+import androidx.compose.foundation.BorderStroke
+import androidx.compose.foundation.clickable
+import androidx.compose.foundation.isSystemInDarkTheme
+import androidx.compose.foundation.layout.Arrangement
+import androidx.compose.foundation.layout.Box
+import androidx.compose.foundation.layout.Column
+import androidx.compose.foundation.layout.Spacer
+import androidx.compose.foundation.layout.fillMaxSize
+import androidx.compose.foundation.layout.fillMaxWidth
+import androidx.compose.foundation.layout.height
+import androidx.compose.foundation.layout.heightIn
+import androidx.compose.foundation.layout.padding
+import androidx.compose.foundation.layout.size
+import androidx.compose.foundation.layout.statusBarsPadding
+import androidx.compose.foundation.lazy.LazyColumn
+import androidx.compose.foundation.lazy.grid.GridCells
+import androidx.compose.foundation.lazy.grid.LazyVerticalGrid
+import androidx.compose.foundation.lazy.grid.items
+import androidx.compose.foundation.lazy.items
+import androidx.compose.foundation.rememberScrollState
+import androidx.compose.foundation.shape.CircleShape
+import androidx.compose.foundation.verticalScroll
+import androidx.compose.material.icons.Icons
+import androidx.compose.material.icons.automirrored.filled.ArrowBack
+import androidx.compose.material.icons.automirrored.filled.KeyboardArrowRight
+import androidx.compose.material.icons.filled.Check
+import androidx.compose.material.icons.filled.Cloud
+import androidx.compose.material.icons.filled.CloudUpload
+import androidx.compose.material.icons.filled.DarkMode
+import androidx.compose.material.icons.filled.Description
+import androidx.compose.material.icons.filled.Fingerprint
+import androidx.compose.material.icons.filled.Folder
+import androidx.compose.material.icons.filled.FolderOpen
+import androidx.compose.material.icons.filled.History
+import androidx.compose.material.icons.filled.Info
+import androidx.compose.material.icons.filled.Language
+import androidx.compose.material.icons.filled.PhotoLibrary
+import androidx.compose.material.icons.filled.Storage
+import androidx.compose.material.icons.filled.VpnKey
+import androidx.compose.material.icons.filled.Wifi
+import androidx.compose.material3.AlertDialog
+import androidx.compose.material3.CenterAlignedTopAppBar
+import androidx.compose.material3.ExperimentalMaterial3Api
+import androidx.compose.material3.HorizontalDivider
+import androidx.compose.material3.Icon
+import androidx.compose.material3.IconButton
+import androidx.compose.material3.ListItem
+import androidx.compose.material3.MaterialTheme
+import androidx.compose.material3.Scaffold
+import androidx.compose.material3.Surface
+import androidx.compose.material3.Switch
+import androidx.compose.material3.Text
+import androidx.compose.material3.TextButton
+import androidx.compose.runtime.Composable
+import androidx.compose.runtime.LaunchedEffect
+import androidx.compose.runtime.collectAsState
+import androidx.compose.runtime.getValue
+import androidx.compose.runtime.mutableStateOf
+import androidx.compose.runtime.remember
+import androidx.compose.runtime.setValue
+import androidx.compose.ui.Alignment
+import androidx.compose.ui.Modifier
+import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.graphics.vector.ImageVector
+import androidx.compose.ui.platform.LocalContext
+import androidx.compose.ui.res.stringResource
+import androidx.compose.ui.tooling.preview.Preview
+import androidx.compose.ui.unit.dp
+import androidx.hilt.lifecycle.viewmodel.compose.hiltViewModel
+import coil.compose.AsyncImage
+import com.awd.teledrive.R
+import com.awd.teledrive.data.repository.SettingsRepository
+import com.awd.teledrive.data.repository.TelegramUserProfile
+import com.awd.teledrive.data.repository.UpdateState
+import com.awd.teledrive.ui.screens.home.HomeViewModel
+import com.awd.teledrive.ui.screens.security.SecurityViewModel
+import com.awd.teledrive.ui.theme.TeledriveTheme
+import com.awd.teledrive.ui.theme.ThemeViewModel
+import java.io.File
+import java.text.SimpleDateFormat
+import java.util.Date
+import java.util.Locale
+
+data class AppLanguageOption(
+    val code: String,
+    val displayName: String
+)
+
+val SUPPORTED_APP_LANGUAGES = listOf(
+    AppLanguageOption("en", "English"),
+    AppLanguageOption("zh", "中文 (Chinese)"),
+    AppLanguageOption("hi", "हिन्दी (Hindi)"),
+    AppLanguageOption("es", "Español (Spanish)"),
+    AppLanguageOption("fr", "Français (French)"),
+    AppLanguageOption("ar", "العربية (Arabic)"),
+    AppLanguageOption("pt", "Português (Portuguese)"),
+    AppLanguageOption("ru", "Русский (Russian)"),
+    AppLanguageOption("ur", "اردو (Urdu)"),
+    AppLanguageOption("de", "Deutsch (German)"),
+    AppLanguageOption("bn", "বাংলা (Bengali)")
+)
+
+fun getLanguageDisplayName(code: String): String {
+    val normalized = code.lowercase(Locale.ROOT).substringBefore("-")
+    return SUPPORTED_APP_LANGUAGES.firstOrNull { it.code == normalized }?.displayName ?: "English"
+}
+
+data class SettingsUiState(
+    val isDarkMode: Boolean,
+    val themeMode: Boolean? = null,
+    val themeColor: Color,
+    val isSecurityEnabled: Boolean,
+    val isBiometricEnabled: Boolean,
+    val totalStorageUsed: Long,
+    val internalCacheSize: Long,
+    val cacheSizeLimit: Long,
+    val cacheAgeLimit: Int,
+    val isAutoBackupEnabled: Boolean,
+    val lastBackupTime: Long,
+    val currentLanguage: String,
+    val downloadUri: String?,
+    val versionName: String,
+    val versionCode: Long,
+    val updateState: UpdateState,
+    val userProfile: TelegramUserProfile? = null
+)
+
+@Composable
+fun SettingsScreen(
+    onBack: () -> Unit,
+    onNavigateToBackupFolders: () -> Unit,
+    onNavigateToLogs: () -> Unit,
+    onNavigateToCacheDetails: () -> Unit,
+    onNavigateToCloudAnalysis: () -> Unit,
+    onNavigateToAbout: () -> Unit,
+    onNavigateToProfile: () -> Unit = {},
+    viewModel: SettingsViewModel = hiltViewModel(),
+    themeViewModel: ThemeViewModel = hiltViewModel(),
+    securityViewModel: SecurityViewModel = hiltViewModel(),
+    homeViewModel: HomeViewModel = hiltViewModel(),
+    backupViewModel: BackupViewModel = hiltViewModel()
+) {
+    val isDarkMode by themeViewModel.isDarkMode.collectAsState()
+    val themeColor by themeViewModel.themeColor.collectAsState()
+    val isSecurityEnabled by securityViewModel.isSecurityEnabled.collectAsState()
+    val isBiometricEnabled by securityViewModel.isBiometricEnabled.collectAsState()
+    val totalStorageUsed by homeViewModel.totalStorageUsed.collectAsState()
+    val internalCacheSize by viewModel.internalCacheSize.collectAsState()
+    val cacheSizeLimit by viewModel.cacheSizeLimit.collectAsState()
+    val cacheAgeLimit by viewModel.cacheAgeLimit.collectAsState()
+    val isAutoBackupEnabled by backupViewModel.isAutoBackupEnabled.collectAsState()
+    val isBackupWifiOnly by backupViewModel.isBackupWifiOnly.collectAsState()
+    val lastBackupTime by backupViewModel.lastBackupTime.collectAsState()
+    val currentLanguage by viewModel.currentLanguage.collectAsState()
+    val downloadUri by viewModel.downloadUri.collectAsState()
+    val updateState by viewModel.updateState.collectAsState()
+    val isThumbnailAutoDownloadEnabled by viewModel.isThumbnailAutoDownloadEnabled.collectAsState()
+    val showCacheWarning by viewModel.showCacheWarning.collectAsState()
+    val cloudBackups by viewModel.cloudBackups.collectAsState()
+    val userProfile by viewModel.userProfile.collectAsState()
+
+    val context = LocalContext.current
+
+    val exportLauncher = rememberLauncherForActivityResult(
+        contract = ActivityResultContracts.CreateDocument("application/json")
+    ) { uri ->
+        uri?.let {
+            val json = viewModel.exportMetadata()
+            context.contentResolver.openOutputStream(it)?.use { out ->
+                out.write(json.toByteArray())
+            }
+            Toast.makeText(context, context.getString(R.string.export_success, it.path ?: ""), Toast.LENGTH_LONG).show()
+        }
+    }
+
+    val importLauncher = rememberLauncherForActivityResult(
+        contract = ActivityResultContracts.GetContent()
+    ) { uri ->
+        uri?.let {
+            context.contentResolver.openInputStream(it)?.use { input ->
+                val json = input.bufferedReader().readText()
+                if (viewModel.importMetadata(json)) {
+                    Toast.makeText(context, context.getString(R.string.import_success), Toast.LENGTH_SHORT).show()
+                } else {
+                    Toast.makeText(context, context.getString(R.string.import_fail_format), Toast.LENGTH_LONG).show()
+                }
+            }
+        }
+    }
+
+    LaunchedEffect(Unit) {
+        backupViewModel.feedback.collect { feedback ->
+            val msg = when (feedback) {
+                BackupFeedback.NoFolders -> context.getString(R.string.no_backup_folders)
+                BackupFeedback.Starting -> context.getString(R.string.backup_starting)
+            }
+            Toast.makeText(context, msg, Toast.LENGTH_SHORT).show()
+        }
+    }
+
+    val uiState = SettingsUiState(
+        isDarkMode = isDarkMode ?: isSystemInDarkTheme(),
+        themeMode = isDarkMode,
+        themeColor = themeColor,
+        isSecurityEnabled = isSecurityEnabled,
+        isBiometricEnabled = isBiometricEnabled,
+        totalStorageUsed = totalStorageUsed,
+        internalCacheSize = internalCacheSize,
+        cacheSizeLimit = cacheSizeLimit,
+        cacheAgeLimit = cacheAgeLimit,
+        isAutoBackupEnabled = isAutoBackupEnabled,
+        lastBackupTime = lastBackupTime,
+        currentLanguage = currentLanguage,
+        downloadUri = downloadUri,
+        versionName = viewModel.versionName,
+        versionCode = viewModel.versionCode,
+        updateState = updateState,
+        userProfile = userProfile
+    )
+
+    SettingsContent(
+        uiState = uiState,
+        isThumbnailAutoDownloadEnabled = isThumbnailAutoDownloadEnabled,
+        isBackupWifiOnly = isBackupWifiOnly,
+        onBack = onBack,
+        onLogout = {
+            viewModel.logout()
+            // Memberikan sedikit waktu bagi TDLib untuk mengirim request logout sebelum restart
+            val intent = context.packageManager.getLaunchIntentForPackage(context.packageName)
+            intent?.addFlags(android.content.Intent.FLAG_ACTIVITY_CLEAR_TOP or android.content.Intent.FLAG_ACTIVITY_NEW_TASK)
+            context.startActivity(intent)
+            (context as? android.app.Activity)?.finish()
+        },
+        onNavigateToBackupFolders = onNavigateToBackupFolders,
+        onNavigateToCacheDetails = onNavigateToCacheDetails,
+        onNavigateToCloudAnalysis = onNavigateToCloudAnalysis,
+        onNavigateToAbout = onNavigateToAbout,
+        onNavigateToProfile = onNavigateToProfile,
+        onSetDarkMode = { themeViewModel.setDarkMode(it) },
+        onSetThemeColor = { themeViewModel.setThemeColor(it) },
+        onSetSecurityEnabled = { securityViewModel.setSecurityEnabled(it) },
+        onSetBiometricEnabled = { securityViewModel.setBiometricEnabled(it) },
+        onSetAutoBackupEnabled = { backupViewModel.setAutoBackupEnabled(it) },
+        onSetBackupWifiOnly = { backupViewModel.setBackupWifiOnly(it) },
+        onTriggerManualBackup = { backupViewModel.triggerManualBackup() },
+        onNavigateToLogs = onNavigateToLogs,
+        onClearCache = viewModel::clearCache,
+        onSetLanguage = viewModel::setLanguage,
+        onSetDownloadUri = viewModel::setDownloadUri,
+        onSetCacheSizeLimit = viewModel::setCacheSizeLimit,
+        onSetCacheAgeLimit = viewModel::setCacheAgeLimit,
+        onSetThumbnailAutoDownload = viewModel::setThumbnailAutoDownloadEnabled,
+        showCacheWarning = showCacheWarning,
+        onDismissCacheWarning = viewModel::dismissCacheWarning,
+        onExportMetadata = {
+            exportLauncher.launch("telenest_metadata_${System.currentTimeMillis()}.json")
+        },
+        onImportMetadata = {
+            importLauncher.launch("application/json")
+        },
+        onManualCloudBackup = {
+            viewModel.triggerCloudMetadataBackup()
+            Toast.makeText(context, context.getString(R.string.backup_sent_saved), Toast.LENGTH_SHORT).show()
+        },
+        cloudBackups = cloudBackups,
+        onLoadCloudBackups = viewModel::loadCloudBackups,
+        onRestoreCloudBackup = { msgId ->
+            viewModel.restoreCloudBackup(msgId) { success ->
+                if (success) {
+                    Toast.makeText(context, context.getString(R.string.import_success), Toast.LENGTH_SHORT).show()
+                } else {
+                    Toast.makeText(context, context.getString(R.string.restore_fail), Toast.LENGTH_LONG).show()
+                }
+            }
+        }
+    )
+}
+
+@OptIn(ExperimentalMaterial3Api::class, androidx.compose.foundation.layout.ExperimentalLayoutApi::class)
+@Composable
+fun SettingsContent(
+    uiState: SettingsUiState,
+    isThumbnailAutoDownloadEnabled: Boolean,
+    isBackupWifiOnly: Boolean,
+    showCacheWarning: Boolean,
+    onBack: () -> Unit,
+    onLogout: () -> Unit,
+    onNavigateToBackupFolders: () -> Unit,
+    onNavigateToCacheDetails: () -> Unit,
+    onNavigateToCloudAnalysis: () -> Unit,
+    onNavigateToAbout: () -> Unit,
+    onNavigateToProfile: () -> Unit = {},
+    onSetDarkMode: (Boolean?) -> Unit,
+    onSetThemeColor: (Color) -> Unit,
+    onSetSecurityEnabled: (Boolean) -> Unit,
+    onSetBiometricEnabled: (Boolean) -> Unit,
+    onSetAutoBackupEnabled: (Boolean) -> Unit,
+    onSetBackupWifiOnly: (Boolean) -> Unit,
+    onTriggerManualBackup: () -> Unit,
+    onNavigateToLogs: () -> Unit,
+    onClearCache: () -> Unit,
+    onSetLanguage: (String) -> Unit,
+    onSetDownloadUri: (String?) -> Unit,
+    onSetCacheSizeLimit: (Long) -> Unit,
+    onSetCacheAgeLimit: (Int) -> Unit,
+    onSetThumbnailAutoDownload: (Boolean) -> Unit,
+    onDismissCacheWarning: () -> Unit,
+    onExportMetadata: () -> Unit,
+    onImportMetadata: () -> Unit,
+    onManualCloudBackup: () -> Unit,
+    cloudBackups: List<com.awd.teledrive.domain.model.CloudBackup>,
+    onLoadCloudBackups: () -> Unit,
+    onRestoreCloudBackup: (Long) -> Unit
+) {
+    var showLanguageDialog by remember { mutableStateOf(false) }
+    var showSetPasswordConfirm by remember { mutableStateOf(false) }
+    var showLanguageRestartConfirm by remember { mutableStateOf(false) }
+    var showCacheSizeDialog by remember { mutableStateOf(false) }
+    var showCacheAgeDialog by remember { mutableStateOf(false) }
+    var showImportConfirm by remember { mutableStateOf(false) }
+    var showCloudBackupsDialog by remember { mutableStateOf(false) }
+
+    val context = LocalContext.current
+    val scrollState = rememberScrollState()
+    var showClearCacheConfirm by remember { mutableStateOf(false) }
+    var showLogoutConfirm by remember { mutableStateOf(false) }
+    var showThemeRestartConfirm by remember { mutableStateOf(false) }
+    var showThemeColorDialog by remember { mutableStateOf(false) }
+
+    val folderLauncher = androidx.activity.compose.rememberLauncherForActivityResult(
+        contract = androidx.activity.result.contract.ActivityResultContracts.OpenDocumentTree()
+    ) { uri ->
+        uri?.let {
+            val takeFlags: Int = android.content.Intent.FLAG_GRANT_READ_URI_PERMISSION or
+                    android.content.Intent.FLAG_GRANT_WRITE_URI_PERMISSION
+            context.contentResolver.takePersistableUriPermission(it, takeFlags)
+            onSetDownloadUri(it.toString())
+        }
+    }
+
+    if (showLanguageRestartConfirm) {
+        AlertDialog(
+            onDismissRequest = { showLanguageRestartConfirm = false },
+            title = { Text(stringResource(R.string.language_changed_title)) },
+            text = { Text(stringResource(R.string.language_changed_message)) },
+            confirmButton = {
+                TextButton(onClick = {
+                    showLanguageRestartConfirm = false
+                    val intent = context.packageManager.getLaunchIntentForPackage(context.packageName)
+                    intent?.addFlags(android.content.Intent.FLAG_ACTIVITY_CLEAR_TOP or android.content.Intent.FLAG_ACTIVITY_NEW_TASK)
+                    context.startActivity(intent)
+                    (context as? android.app.Activity)?.finish()
+                }) { Text(stringResource(R.string.restart_app)) }
+            },
+            dismissButton = {
+                TextButton(onClick = { showLanguageRestartConfirm = false }) { Text(stringResource(R.string.cancel)) }
+            }
+        )
+    }
+
+    if (showSetPasswordConfirm) {
+        AlertDialog(
+            onDismissRequest = { showSetPasswordConfirm = false },
+            title = { Text(stringResource(R.string.set_password_title)) },
+            text = { Text(stringResource(R.string.set_password_message)) },
+            confirmButton = {
+                TextButton(onClick = {
+                    showSetPasswordConfirm = false
+                    val intent = context.packageManager.getLaunchIntentForPackage(context.packageName)
+                    intent?.addFlags(android.content.Intent.FLAG_ACTIVITY_CLEAR_TOP or android.content.Intent.FLAG_ACTIVITY_NEW_TASK)
+                    context.startActivity(intent)
+                    (context as? android.app.Activity)?.finish()
+                }) { Text(stringResource(R.string.confirm)) }
+            },
+            dismissButton = {
+                TextButton(onClick = { 
+                    showSetPasswordConfirm = false
+                    onSetSecurityEnabled(false) 
+                }) { Text(stringResource(R.string.cancel)) }
+            }
+        )
+    }
+
+    if (showLogoutConfirm) {
+        AlertDialog(
+            onDismissRequest = { showLogoutConfirm = false },
+            title = { Text(stringResource(R.string.logout_confirm_title)) },
+            text = { Text(stringResource(R.string.logout_confirm_message)) },
+            confirmButton = {
+                TextButton(onClick = {
+                    showLogoutConfirm = false
+                    onLogout()
+                }) { Text(stringResource(R.string.logout), color = MaterialTheme.colorScheme.error) }
+            },
+            dismissButton = {
+                TextButton(onClick = { showLogoutConfirm = false }) { Text(stringResource(R.string.cancel)) }
+            }
+        )
+    }
+
+    if (showClearCacheConfirm) {
+        AlertDialog(
+            onDismissRequest = { showClearCacheConfirm = false },
+            title = { Text(stringResource(R.string.clear_cache_confirm_title)) },
+            text = { Text(stringResource(R.string.clear_cache_confirm_message)) },
+            confirmButton = {
+                TextButton(onClick = {
+                    onClearCache()
+                    showClearCacheConfirm = false
+                    Toast.makeText(context, context.getString(R.string.cache_cleared), Toast.LENGTH_SHORT).show()
+                }) { Text(stringResource(R.string.delete), color = MaterialTheme.colorScheme.error) }
+            },
+            dismissButton = {
+                TextButton(onClick = { showClearCacheConfirm = false }) { Text(stringResource(R.string.cancel)) }
+            }
+        )
+    }
+
+    if (showThemeRestartConfirm) {
+        AlertDialog(
+            onDismissRequest = { showThemeRestartConfirm = false },
+            title = { Text(stringResource(R.string.theme_changed_title)) },
+            text = { Text(stringResource(R.string.theme_changed_message)) },
+            confirmButton = {
+                TextButton(onClick = {
+                    showThemeRestartConfirm = false
+                    val intent = context.packageManager.getLaunchIntentForPackage(context.packageName)
+                    intent?.addFlags(android.content.Intent.FLAG_ACTIVITY_CLEAR_TOP or android.content.Intent.FLAG_ACTIVITY_NEW_TASK)
+                    context.startActivity(intent)
+                    (context as? android.app.Activity)?.finish()
+                }) { Text(stringResource(R.string.restart_app)) }
+            },
+            dismissButton = {
+                TextButton(onClick = { showThemeRestartConfirm = false }) { Text(stringResource(R.string.cancel)) }
+            }
+        )
+    }
+
+    if (showLanguageDialog) {
+        val currentLangNormalized = uiState.currentLanguage.lowercase(Locale.ROOT).substringBefore("-")
+        AlertDialog(
+            onDismissRequest = { showLanguageDialog = false },
+            title = { Text(stringResource(R.string.language)) },
+            text = {
+                LazyColumn(modifier = Modifier.heightIn(max = 420.dp)) {
+                    items(SUPPORTED_APP_LANGUAGES) { langOption ->
+                        ListItem(
+                            headlineContent = { Text(langOption.displayName) },
+                            modifier = Modifier.clickable {
+                                onSetLanguage(langOption.code)
+                                showLanguageDialog = false
+                                showLanguageRestartConfirm = true
+                            },
+                            trailingContent = {
+                                if (currentLangNormalized == langOption.code) {
+                                    Icon(Icons.Default.Check, null)
+                                }
+                            }
+                        )
+                    }
+                }
+            },
+            confirmButton = {
+                TextButton(onClick = { showLanguageDialog = false }) {
+                    Text(stringResource(R.string.cancel))
+                }
+            }
+        )
+    }
+
+    if (showCacheSizeDialog) {
+        AlertDialog(
+            onDismissRequest = { showCacheSizeDialog = false },
+            title = { Text(stringResource(R.string.cache_size_limit)) },
+            text = {
+                Column {
+                    SettingsRepository.CACHE_SIZE_OPTIONS.forEach { option: Long ->
+                        ListItem(
+                            headlineContent = { Text(if (option == 0L) stringResource(R.string.no_limit) else formatSize(option)) },
+                            modifier = Modifier.clickable {
+                                onSetCacheSizeLimit(option)
+                                showCacheSizeDialog = false
+                            },
+                            trailingContent = {
+                                if (uiState.cacheSizeLimit == option) Icon(Icons.Default.Check, null)
+                            }
+                        )
+                    }
+                }
+            },
+            confirmButton = {}
+        )
+    }
+
+    if (showCacheAgeDialog) {
+        AlertDialog(
+            onDismissRequest = { showCacheAgeDialog = false },
+            title = { Text(stringResource(R.string.media_age_limit)) },
+            text = {
+                Column {
+                    SettingsRepository.CACHE_AGE_OPTIONS.forEach { option: Int ->
+                        ListItem(
+                            headlineContent = { Text(formatCacheAge(option, context)) },
+                            modifier = Modifier.clickable {
+                                onSetCacheAgeLimit(option)
+                                showCacheAgeDialog = false
+                            },
+                            trailingContent = {
+                                if (uiState.cacheAgeLimit == option) Icon(Icons.Default.Check, null)
+                            }
+                        )
+                    }
+                }
+            },
+            confirmButton = {}
+        )
+    }
+
+    if (showThemeColorDialog) {
+        AlertDialog(
+            onDismissRequest = { showThemeColorDialog = false },
+            title = { Text(stringResource(R.string.theme_color)) },
+            text = {
+                Box(modifier = Modifier.height(280.dp)) {
+                    val colors = listOf(
+                        Color(0xFF000000), // Solid Pure Black (Default)
+                        Color(0xFF24A1DE), Color(0xFF673AB7), Color(0xFF3F51B5),
+                        Color(0xFF2196F3), Color(0xFF00BCD4), Color(0xFF009688),
+                        Color(0xFF4CAF50), Color(0xFF8BC34A), Color(0xFFFFC107),
+                        Color(0xFFFF9800), Color(0xFFFF5722), Color(0xFFE91E63),
+                        Color(0xFF9C27B0), Color(0xFF607D8B)
+                    )
+                    LazyVerticalGrid(
+                        columns = GridCells.Fixed(4),
+                        horizontalArrangement = Arrangement.spacedBy(12.dp),
+                        verticalArrangement = Arrangement.spacedBy(12.dp),
+                        modifier = Modifier.fillMaxSize()
+                    ) {
+                        items(colors) { color ->
+                            Surface(
+                                onClick = {
+                                    onSetThemeColor(color)
+                                    showThemeColorDialog = false
+                                },
+                                color = color,
+                                shape = CircleShape,
+                                modifier = Modifier.size(48.dp),
+                                border = if (uiState.themeColor == color)
+                                    BorderStroke(3.dp, if (color == Color(0xFF000000)) Color(0xFF4285F4) else MaterialTheme.colorScheme.onSurface)
+                                else if (color == Color(0xFF000000))
+                                    BorderStroke(1.5.dp, MaterialTheme.colorScheme.outlineVariant)
+                                else null,
+                                tonalElevation = 4.dp
+                            ) {
+                                if (uiState.themeColor == color) {
+                                    Box(contentAlignment = Alignment.Center) {
+                                        Icon(
+                                            imageVector = Icons.Default.Check,
+                                            contentDescription = null,
+                                            tint = Color.White,
+                                            modifier = Modifier.size(24.dp)
+                                        )
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            },
+            confirmButton = {
+                TextButton(onClick = { showThemeColorDialog = false }) {
+                    Text(stringResource(R.string.cancel))
+                }
+            }
+        )
+    }
+
+    Scaffold(
+        topBar = {
+            CenterAlignedTopAppBar(
+                title = { Text(stringResource(R.string.settings)) },
+                navigationIcon = {
+                    IconButton(onClick = onBack) {
+                        Icon(Icons.AutoMirrored.Filled.ArrowBack, contentDescription = stringResource(R.string.back))
+                    }
+                },
+                modifier = Modifier.statusBarsPadding()
+            )
+        }
+    ) { padding ->
+        Column(
+            modifier = Modifier
+                .fillMaxSize()
+                .padding(padding)
+                .verticalScroll(scrollState)
+        ) {
+            SettingsCategory(title = stringResource(R.string.display))
+            // 3-Way Theme Mode Selector: Light, Dark, Use System
+            Column(
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .padding(horizontal = 16.dp, vertical = 10.dp),
+                verticalArrangement = Arrangement.spacedBy(10.dp)
+            ) {
+                androidx.compose.foundation.layout.Row(
+                    verticalAlignment = Alignment.CenterVertically,
+                    horizontalArrangement = Arrangement.spacedBy(16.dp)
+                ) {
+                    Icon(
+                        imageVector = Icons.Default.DarkMode,
+                        contentDescription = null,
+                        tint = MaterialTheme.colorScheme.onSurfaceVariant
+                    )
+                    Column(modifier = Modifier.weight(1f)) {
+                        Text(
+                            text = "Theme Mode",
+                            style = MaterialTheme.typography.bodyLarge,
+                            color = MaterialTheme.colorScheme.onSurface
+                        )
+                        Text(
+                            text = when (uiState.themeMode) {
+                                false -> "Light Mode"
+                                true -> "Dark Mode"
+                                null -> "Use System Default (Auto)"
+                            },
+                            style = MaterialTheme.typography.bodyMedium,
+                            color = MaterialTheme.colorScheme.onSurfaceVariant
+                        )
+                    }
+                }
+                Surface(
+                    color = MaterialTheme.colorScheme.surfaceVariant.copy(alpha = 0.55f),
+                    shape = androidx.compose.foundation.shape.RoundedCornerShape(14.dp),
+                    modifier = Modifier.fillMaxWidth()
+                ) {
+                    androidx.compose.foundation.layout.Row(
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .padding(4.dp),
+                        horizontalArrangement = Arrangement.spacedBy(4.dp)
+                    ) {
+                        val themeOptions: List<Pair<Boolean?, String>> = listOf(
+                            false to "Light",
+                            true to "Dark",
+                            null to "Use System"
+                        )
+                        themeOptions.forEach { (modeValue, label) ->
+                            val isSelected = uiState.themeMode == modeValue
+                            Surface(
+                                onClick = {
+                                    if (uiState.themeMode != modeValue) {
+                                        onSetDarkMode(modeValue)
+                                    }
+                                },
+                                color = if (isSelected) MaterialTheme.colorScheme.primary else Color.Transparent,
+                                shape = androidx.compose.foundation.shape.RoundedCornerShape(10.dp),
+                                modifier = Modifier.weight(1f)
+                            ) {
+                                Box(
+                                    contentAlignment = Alignment.Center,
+                                    modifier = Modifier.padding(vertical = 10.dp, horizontal = 8.dp)
+                                ) {
+                                    Text(
+                                        text = label,
+                                        style = MaterialTheme.typography.labelLarge,
+                                        color = if (isSelected) MaterialTheme.colorScheme.onPrimary else MaterialTheme.colorScheme.onSurfaceVariant,
+                                        fontWeight = if (isSelected) androidx.compose.ui.text.font.FontWeight.Bold else androidx.compose.ui.text.font.FontWeight.Medium
+                                    )
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+
+            SettingsToggleRow(
+                icon = Icons.Default.PhotoLibrary,
+                title = stringResource(R.string.auto_download_thumbnails),
+                subtitle = stringResource(R.string.auto_download_thumbnails_desc),
+                checked = isThumbnailAutoDownloadEnabled,
+                onCheckedChange = onSetThumbnailAutoDownload
+            )
+            
+            SettingsClickableRow(
+                icon = Icons.Default.Check,
+                title = stringResource(R.string.theme_color),
+                subtitle = stringResource(R.string.choose_color_desc),
+                onClick = { showThemeColorDialog = true }
+            )
+
+            SettingsClickableRow(
+                icon = Icons.Default.Language,
+                title = stringResource(R.string.language),
+                subtitle = getLanguageDisplayName(uiState.currentLanguage),
+                onClick = { showLanguageDialog = true }
+            )
+
+            HorizontalDivider(modifier = Modifier.padding(vertical = 8.dp))
+            SettingsCategory(title = stringResource(R.string.security))
+            SettingsToggleRow(
+                icon = Icons.Default.VpnKey,
+                title = stringResource(R.string.master_password),
+                subtitle = stringResource(R.string.require_password),
+                checked = uiState.isSecurityEnabled,
+                onCheckedChange = { enabled ->
+                    if (enabled && !uiState.isSecurityEnabled) {
+                        showSetPasswordConfirm = true
+                    }
+                    onSetSecurityEnabled(enabled)
+                }
+            )
+            SettingsToggleRow(
+                icon = Icons.Default.Fingerprint,
+                title = stringResource(R.string.biometric_unlock),
+                checked = uiState.isBiometricEnabled,
+                enabled = uiState.isSecurityEnabled,
+                onCheckedChange = onSetBiometricEnabled
+            )
+
+            HorizontalDivider(modifier = Modifier.padding(vertical = 8.dp))
+            SettingsCategory(title = stringResource(R.string.storage))
+            
+            SettingsClickableRow(
+                icon = Icons.Default.Cloud,
+                title = stringResource(R.string.cloud_usage),
+                subtitle = stringResource(R.string.cloud_usage_subtitle, formatSize(uiState.totalStorageUsed)),
+                onClick = onNavigateToCloudAnalysis
+            )
+            
+            SettingsClickableRow(
+                icon = Icons.Default.Storage,
+                title = stringResource(R.string.internal_cache),
+                subtitle = stringResource(R.string.internal_cache_subtitle, formatSize(uiState.internalCacheSize)),
+                onClick = onNavigateToCacheDetails
+            )
+
+            SettingsClickableRow(
+                icon = Icons.Default.Storage,
+                title = stringResource(R.string.cache_size_limit),
+                subtitle = if (uiState.cacheSizeLimit == 0L) stringResource(R.string.no_limit) else formatSize(uiState.cacheSizeLimit),
+                onClick = { showCacheSizeDialog = true }
+            )
+
+            SettingsClickableRow(
+                icon = Icons.Default.History,
+                title = stringResource(R.string.media_age_limit),
+                subtitle = formatCacheAge(uiState.cacheAgeLimit, context),
+                onClick = { showCacheAgeDialog = true }
+            )
+
+            HorizontalDivider(modifier = Modifier.padding(vertical = 8.dp))
+            SettingsCategory(title = "Autosync & Backup Settings")
+            SettingsToggleRow(
+                icon = Icons.Default.Folder,
+                title = "Enable autosync",
+                subtitle = if (uiState.isAutoBackupEnabled) {
+                    if (isBackupWifiOnly) "Monitoring folders in background (Wi-Fi only)" else "Monitoring folders in background (Wi-Fi & Mobile data)"
+                } else {
+                    "Monitor folders and sync automatically in background"
+                },
+                checked = uiState.isAutoBackupEnabled,
+                onCheckedChange = onSetAutoBackupEnabled
+            )
+            SettingsToggleRow(
+                icon = Icons.Default.Wifi,
+                title = stringResource(R.string.backup_wifi_only),
+                subtitle = "Disable to allow syncing over both Wi-Fi and Mobile data",
+                checked = isBackupWifiOnly,
+                enabled = uiState.isAutoBackupEnabled,
+                onCheckedChange = onSetBackupWifiOnly
+            )
+            SettingsClickableRow(
+                icon = Icons.Default.Folder,
+                title = "Synced folders & Sync settings",
+                subtitle = "Configure folder pairs, 7 sync modes (Two-way, Upload, Mirror, Download), schedule, battery & size limits",
+                onClick = onNavigateToBackupFolders
+            )
+            if (uiState.lastBackupTime > 0) {
+                val date = Date(uiState.lastBackupTime)
+                val format = SimpleDateFormat("dd MMM yyyy, HH:mm", Locale.getDefault())
+                SettingsRow(
+                    icon = Icons.Default.History,
+                    title = stringResource(R.string.last_backup, format.format(date))
+                )
+            }
+            SettingsClickableRow(
+                icon = Icons.Default.CloudUpload,
+                title = "Sync all folders now",
+                onClick = onTriggerManualBackup
+            )
+
+            HorizontalDivider(modifier = Modifier.padding(vertical = 8.dp))
+            SettingsCategory(title = stringResource(R.string.downloads))
+            
+            val downloadPath = if (uiState.downloadUri.isNullOrEmpty()) {
+                stringResource(R.string.download_location_desc)
+            } else {
+                android.net.Uri.parse(uiState.downloadUri).path?.substringAfterLast(':') ?: uiState.downloadUri
+            }
+            
+            SettingsClickableRow(
+                icon = Icons.Default.FolderOpen,
+                title = stringResource(R.string.download_location),
+                subtitle = downloadPath,
+                onClick = { 
+                    folderLauncher.launch(null)
+                }
+            )
+            if (!uiState.downloadUri.isNullOrEmpty()) {
+                TextButton(
+                    onClick = { onSetDownloadUri(null) },
+                    modifier = Modifier.padding(horizontal = 16.dp)
+                ) {
+                    Text(stringResource(R.string.reset_to_default))
+                }
+            }
+
+            HorizontalDivider(modifier = Modifier.padding(vertical = 8.dp))
+            SettingsCategory(title = stringResource(R.string.metadata_backup))
+            SettingsClickableRow(
+                icon = Icons.Default.CloudUpload,
+                title = stringResource(R.string.export_metadata),
+                subtitle = stringResource(R.string.metadata_backup_desc),
+                onClick = onExportMetadata
+            )
+            SettingsClickableRow(
+                icon = Icons.Default.CloudUpload,
+                title = stringResource(R.string.backup_metadata_cloud),
+                subtitle = stringResource(R.string.backup_metadata_cloud_desc),
+                onClick = onManualCloudBackup
+            )
+            SettingsClickableRow(
+                icon = Icons.Default.CloudUpload,
+                title = stringResource(R.string.import_metadata),
+                subtitle = stringResource(R.string.import_confirm_message),
+                onClick = { showImportConfirm = true }
+            )
+            
+            SettingsClickableRow(
+                icon = Icons.Default.History,
+                title = stringResource(R.string.restore_from_cloud),
+                subtitle = stringResource(R.string.cloud_backups_desc),
+                onClick = { 
+                    onLoadCloudBackups()
+                    showCloudBackupsDialog = true 
+                }
+            )
+
+            Text(
+                text = stringResource(R.string.metadata_sync_info),
+                style = MaterialTheme.typography.labelSmall,
+                color = MaterialTheme.colorScheme.outline,
+                modifier = Modifier.padding(horizontal = 16.dp, vertical = 8.dp)
+            )
+
+            HorizontalDivider(modifier = Modifier.padding(vertical = 8.dp))
+            SettingsCategory(title = stringResource(R.string.system))
+            
+            SettingsClickableRow(
+                icon = Icons.Default.Description,
+                title = stringResource(R.string.app_logs),
+                subtitle = stringResource(R.string.app_logs_desc),
+                onClick = onNavigateToLogs
+            )
+
+            SettingsClickableRow(
+                icon = Icons.Default.Info,
+                title = stringResource(R.string.about_app),
+                subtitle = "v${uiState.versionName} (${uiState.versionCode})",
+                onClick = onNavigateToAbout
+            )
+
+            if (showCloudBackupsDialog) {
+                AlertDialog(
+                    onDismissRequest = { showCloudBackupsDialog = false },
+                    title = { Text(stringResource(R.string.cloud_backups)) },
+                    text = {
+                        if (cloudBackups.isEmpty()) {
+                            Text(stringResource(R.string.no_backups_found), modifier = Modifier.padding(16.dp))
+                        } else {
+                            LazyColumn(modifier = Modifier.heightIn(max = 400.dp)) {
+                                items(cloudBackups) { backup ->
+                                    val dateStr = SimpleDateFormat("dd MMM yyyy, HH:mm", Locale.getDefault()).format(Date(backup.date))
+                                    ListItem(
+                                        headlineContent = { Text(dateStr) },
+                                        supportingContent = { Text(stringResource(R.string.items_count, backup.folderCount)) },
+                                        trailingContent = {
+                                            TextButton(onClick = {
+                                                onRestoreCloudBackup(backup.messageId)
+                                                showCloudBackupsDialog = false
+                                            }) {
+                                                Text(stringResource(R.string.restore))
+                                            }
+                                        }
+                                    )
+                                }
+                            }
+                        }
+                    },
+                    confirmButton = {
+                        TextButton(onClick = { showCloudBackupsDialog = false }) { Text(stringResource(R.string.cancel)) }
+                    }
+                )
+            }
+
+            if (showImportConfirm) {
+                AlertDialog(
+                    onDismissRequest = { showImportConfirm = false },
+                    title = { Text(stringResource(R.string.import_confirm_title)) },
+                    text = { Text(stringResource(R.string.import_confirm_message)) },
+                    confirmButton = {
+                        TextButton(onClick = {
+                            showImportConfirm = false
+                            onImportMetadata()
+                        }) { Text(stringResource(R.string.confirm)) }
+                    },
+                    dismissButton = {
+                        TextButton(onClick = { showImportConfirm = false }) { Text(stringResource(R.string.cancel)) }
+                    }
+                )
+            }
+
+            Spacer(modifier = Modifier.height(64.dp))
+        }
+    }
+}
+
+@Composable
+private fun TelegramProfileCardRow(
+    userProfile: TelegramUserProfile?,
+    onClick: () -> Unit
+) {
+    val avatarFile = userProfile?.avatarPath?.let { File(it) }?.takeIf { it.exists() }
+    val subtitleText = when {
+        !userProfile?.formattedPhone.isNullOrBlank() && !userProfile?.username.isNullOrBlank() ->
+            "${userProfile?.formattedPhone} • @${userProfile?.username}"
+        !userProfile?.formattedPhone.isNullOrBlank() -> userProfile?.formattedPhone.orEmpty()
+        !userProfile?.username.isNullOrBlank() -> "@${userProfile?.username}"
+        else -> stringResource(R.string.tap_to_view_profile)
+    }
+
+    ListItem(
+        headlineContent = {
+            Text(
+                text = userProfile?.fullName ?: "Telegram Account",
+                style = MaterialTheme.typography.titleMedium
+            )
+        },
+        supportingContent = {
+            Text(
+                text = subtitleText,
+                style = MaterialTheme.typography.bodyMedium,
+                color = MaterialTheme.colorScheme.onSurfaceVariant
+            )
+        },
+        leadingContent = {
+            Surface(
+                modifier = Modifier.size(52.dp),
+                shape = CircleShape,
+                color = MaterialTheme.colorScheme.primaryContainer
+            ) {
+                if (avatarFile != null) {
+                    AsyncImage(
+                        model = avatarFile,
+                        contentDescription = stringResource(R.string.profile),
+                        modifier = Modifier.fillMaxSize(),
+                        contentScale = androidx.compose.ui.layout.ContentScale.Crop
+                    )
+                } else {
+                    val initials = remember(userProfile) {
+                        val f = userProfile?.firstName?.firstOrNull()?.uppercaseChar()?.toString().orEmpty()
+                        val l = userProfile?.lastName?.firstOrNull()?.uppercaseChar()?.toString().orEmpty()
+                        (f + l).ifEmpty { "T" }
+                    }
+                    Box(contentAlignment = Alignment.Center, modifier = Modifier.fillMaxSize()) {
+                        Text(
+                            text = initials,
+                            style = MaterialTheme.typography.titleMedium,
+                            color = MaterialTheme.colorScheme.onPrimaryContainer
+                        )
+                    }
+                }
+            }
+        },
+        trailingContent = {
+            Icon(
+                imageVector = Icons.AutoMirrored.Filled.KeyboardArrowRight,
+                contentDescription = null,
+                tint = MaterialTheme.colorScheme.onSurfaceVariant.copy(alpha = 0.6f)
+            )
+        },
+        modifier = Modifier.clickable(onClick = onClick)
+    )
+}
+
+@Preview(showBackground = true)
+@Composable
+fun SettingsPreview() {
+    TeledriveTheme {
+        SettingsContent(
+            uiState = SettingsUiState(
+                isDarkMode = false,
+                themeMode = null,
+                themeColor = Color(0xFF000000),
+                isSecurityEnabled = true,
+                isBiometricEnabled = true,
+                totalStorageUsed = 1000 * 1000 * 100,
+                internalCacheSize = 1000 * 1000 * 50,
+                cacheSizeLimit = 512 * 1000 * 1000L,
+                cacheAgeLimit = 30 * 24 * 60 * 60,
+                isAutoBackupEnabled = true,
+                lastBackupTime = System.currentTimeMillis(),
+                currentLanguage = "en",
+                downloadUri = null,
+                versionName = "2.9.0",
+                versionCode = 29L,
+                updateState = UpdateState.Idle
+            ),
+            isThumbnailAutoDownloadEnabled = true,
+            isBackupWifiOnly = true,
+            showCacheWarning = false,
+            onBack = {},
+            onLogout = {},
+            onNavigateToBackupFolders = {},
+            onNavigateToCacheDetails = {},
+            onNavigateToCloudAnalysis = {},
+            onNavigateToAbout = {},
+            onSetDarkMode = {},
+            onSetThemeColor = {},
+            onSetSecurityEnabled = {},
+            onSetBiometricEnabled = {},
+            onSetAutoBackupEnabled = {},
+            onSetBackupWifiOnly = {},
+            onTriggerManualBackup = {},
+            onNavigateToLogs = {},
+            onClearCache = {},
+            onSetLanguage = {},
+            onSetDownloadUri = {},
+            onSetCacheSizeLimit = {},
+            onSetCacheAgeLimit = {},
+            onSetThumbnailAutoDownload = {},
+            onDismissCacheWarning = {},
+            onExportMetadata = {},
+            onImportMetadata = {},
+            onManualCloudBackup = {},
+            cloudBackups = emptyList(),
+            onLoadCloudBackups = {},
+            onRestoreCloudBackup = {}
+        )
+    }
+}
+
+@Composable
+fun SettingsCategory(title: String) {
+    Text(
+        text = title,
+        style = MaterialTheme.typography.labelLarge,
+        color = MaterialTheme.colorScheme.primary,
+        modifier = Modifier.padding(horizontal = 16.dp, vertical = 8.dp)
+    )
+}
+
+@Composable
+fun SettingsRow(icon: ImageVector, title: String, subtitle: String? = null) {
+    ListItem(
+        headlineContent = { Text(title) },
+        supportingContent = subtitle?.let { { Text(it) } },
+        leadingContent = { Icon(icon, null, tint = MaterialTheme.colorScheme.onSurfaceVariant) }
+    )
+}
+
+@Composable
+fun SettingsClickableRow(
+    icon: ImageVector,
+    title: String,
+    subtitle: String? = null,
+    showArrow: Boolean = true,
+    onClick: () -> Unit
+) {
+    ListItem(
+        headlineContent = { Text(title) },
+        supportingContent = subtitle?.let { { Text(it) } },
+        leadingContent = { Icon(icon, null, tint = MaterialTheme.colorScheme.onSurfaceVariant) },
+        trailingContent = if (showArrow) {
+            { Icon(Icons.AutoMirrored.Filled.KeyboardArrowRight, null, tint = MaterialTheme.colorScheme.onSurfaceVariant.copy(alpha = 0.5f)) }
+        } else null,
+        modifier = Modifier.clickable(onClick = onClick)
+    )
+}
+
+@Composable
+fun SettingsToggleRow(
+    icon: ImageVector,
+    title: String,
+    subtitle: String? = null,
+    checked: Boolean,
+    enabled: Boolean = true,
+    onCheckedChange: (Boolean) -> Unit
+) {
+    ListItem(
+        headlineContent = { Text(title) },
+        supportingContent = subtitle?.let { { Text(it) } },
+        leadingContent = { Icon(icon, null, tint = MaterialTheme.colorScheme.onSurfaceVariant) },
+        trailingContent = {
+            Switch(
+                checked = checked,
+                onCheckedChange = onCheckedChange,
+                enabled = enabled
+            )
+        },
+        modifier = Modifier.clickable(enabled = enabled) { onCheckedChange(!checked) }
+    )
+}
+
+private fun formatSize(size: Long): String {
+    if (size <= 0) return "0 B"
+    val units = arrayOf("B", "KB", "MB", "GB", "TB")
+    val digitGroups = (Math.log10(size.toDouble()) / Math.log10(1000.0)).toInt().coerceIn(0, units.lastIndex)
+    return String.format(java.util.Locale.getDefault(), "%.1f %s", size / Math.pow(1000.0, digitGroups.toDouble()), units[digitGroups])
+}
+
+private fun formatCacheAge(seconds: Int, context: android.content.Context): String {
+    return when (seconds) {
+        0 -> context.getString(R.string.no_limit)
+        7 * 24 * 60 * 60 -> "1 " + context.getString(R.string.week)
+        30 * 24 * 60 * 60 -> "1 " + context.getString(R.string.month)
+        90 * 24 * 60 * 60 -> "3 " + context.getString(R.string.months)
+        365 * 24 * 60 * 60 -> "1 " + context.getString(R.string.year)
+        else -> context.getString(R.string.seconds_label, seconds)
+    }
+}
