@@ -1,5 +1,6 @@
 package com.awd.teledrive.domain.model
 
+import androidx.compose.runtime.Immutable
 import kotlinx.serialization.Serializable
 
 @Serializable
@@ -68,6 +69,7 @@ enum class SyncMethod(
     }
 }
 
+@Immutable
 @Serializable
 data class SyncFolderPair(
     val id: String = "pair_${System.nanoTime()}",
@@ -115,6 +117,7 @@ data class SyncFolderPair(
         }
 }
 
+@Immutable
 @Serializable
 data class AutosyncGlobalSettings(
     val enableAutosync: Boolean = false,
@@ -197,6 +200,7 @@ data class AutosyncGlobalSettings(
     }
 }
 
+@Immutable
 @Serializable
 data class SyncedFileRecord(
     val relativePath: String,
@@ -209,11 +213,13 @@ data class SyncedFileRecord(
     val syncedAt: Long = System.currentTimeMillis()
 )
 
+@Immutable
 @Serializable
 data class SyncStateStore(
     val recordsByPair: Map<String, Map<String, SyncedFileRecord>> = emptyMap()
 )
 
+@Immutable
 data class SyncActiveStatus(
     val isRunning: Boolean = false,
     val activePairId: String? = null,

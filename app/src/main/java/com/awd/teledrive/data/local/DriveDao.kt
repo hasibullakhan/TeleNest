@@ -65,6 +65,9 @@ interface DriveDao {
     @Query("SELECT * FROM drive_items WHERE id = :id AND parentChatId = :parentChatId LIMIT 1")
     suspend fun getItemById(id: Long, parentChatId: Long): DriveItemEntity?
 
+    @Query("SELECT * FROM drive_items WHERE parentChatId = :parentChatId AND id IN (:ids)")
+    suspend fun getItemsByIdsInChat(parentChatId: Long, ids: List<Long>): List<DriveItemEntity>
+
     @Query("SELECT * FROM drive_items WHERE virtualId = :virtualId AND isFolder = 1 LIMIT 1")
     suspend fun getVirtualFolderById(virtualId: String): DriveItemEntity?
 
@@ -79,8 +82,17 @@ interface DriveDao {
 
     @Transaction
     suspend fun insertItemsPreservingStarred(items: List<DriveItemEntity>) {
+        if (items.isEmpty()) return
+        val existingMap = HashMap<Pair<Long, Long>, DriveItemEntity>(items.size)
+        items.groupBy { it.parentChatId }.forEach { (chatId, chatItems) ->
+            chatItems.map { it.id }.distinct().chunked(500).forEach { idChunk ->
+                getItemsByIdsInChat(chatId, idChunk).forEach { entity ->
+                    existingMap[entity.id to entity.parentChatId] = entity
+                }
+            }
+        }
         val merged = items.map { incoming ->
-            val existing = getItemById(incoming.id, incoming.parentChatId)
+            val existing = existingMap[incoming.id to incoming.parentChatId]
             if (existing != null) {
                 incoming.copy(
                     isStarred = existing.isStarred || incoming.isStarred,
@@ -117,6 +129,15 @@ interface DriveDao {
            OR (thumbnailRemoteUniqueId = :uniqueId AND (thumbnailPath IS NULL OR thumbnailPath != :path))
     """)
     suspend fun updateFileAndThumbnailPathIfChanged(uniqueId: String, path: String): Int
+
+    @Transaction
+    suspend fun updateFileAndThumbnailPathsBatch(updates: Map<String, String>): Int {
+        var totalUpdated = 0
+        for ((uniqueId, path) in updates) {
+            totalUpdated += updateFileAndThumbnailPathIfChanged(uniqueId, path)
+        }
+        return totalUpdated
+    }
 
     @Query("UPDATE drive_items SET isStarred = :isStarred WHERE id = :id AND parentChatId = :parentChatId")
     suspend fun updateStarred(id: Long, parentChatId: Long, isStarred: Boolean)
@@ -157,8 +178,23 @@ interface DriveDao {
     @Query("DELETE FROM drive_items WHERE parentChatId = :chatId")
     suspend fun deleteItemsByChat(chatId: Long)
 
-    @Query("DELETE FROM drive_items WHERE parentChatId = :chatId AND isFolder = 0 AND isTrashed = 0 AND id NOT IN (:keepIds)")
-    suspend fun deleteFilesByChatNotInList(chatId: Long, keepIds: List<Long>)
+    @Query("SELECT id FROM drive_items WHERE parentChatId = :chatId AND isFolder = 0 AND isTrashed = 0")
+    suspend fun getActiveFileIdsByChatSync(chatId: Long): List<Long>
+
+    @Query("DELETE FROM drive_items WHERE parentChatId = :chatId AND isFolder = 0 AND isTrashed = 0 AND id IN (:idsToDelete)")
+    suspend fun deleteActiveFilesByIdsInChat(chatId: Long, idsToDelete: List<Long>)
+
+    @Transaction
+    suspend fun deleteFilesByChatNotInList(chatId: Long, keepIds: List<Long>) {
+        val existingIds = getActiveFileIdsByChatSync(chatId)
+        if (existingIds.isEmpty()) return
+        val keepSet = keepIds.toHashSet()
+        val toDelete = existingIds.filter { it !in keepSet }
+        if (toDelete.isEmpty()) return
+        toDelete.chunked(500).forEach { chunk ->
+            deleteActiveFilesByIdsInChat(chatId, chunk)
+        }
+    }
 
     @Query("UPDATE drive_items SET thumbnailPath = NULL")
     suspend fun clearAllThumbnailPaths()

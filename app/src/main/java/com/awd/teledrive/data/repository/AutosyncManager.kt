@@ -54,10 +54,13 @@ import java.util.concurrent.atomic.AtomicInteger
 import javax.inject.Inject
 import javax.inject.Singleton
 
+import kotlin.coroutines.coroutineContext
+
 @Singleton
 class AutosyncManager @Inject constructor(
     @ApplicationContext private val context: Context,
     private val driveRepository: DriveRepository,
+    private val transferRepository: TransferRepository,
     private val secureSettings: SecureSettings,
     private val workerManager: TeleDriveWorkerManager
 ) {
@@ -86,18 +89,42 @@ class AutosyncManager @Inject constructor(
     private val _lastSyncTime = MutableStateFlow(0L)
     val lastSyncTime: StateFlow<Long> = _lastSyncTime.asStateFlow()
 
+    @Volatile
     private var currentSyncJob: Job? = null
+    @Volatile
+    private var activeSyncRunJob: Job? = null
     private var periodicTickerJob: Job? = null
     private var instantDebounceJob: Job? = null
     private var mediaContentObserver: ContentObserver? = null
     private var networkCallback: ConnectivityManager.NetworkCallback? = null
+    private var observerSetupJob: Job? = null
     private val activeFileObservers = mutableListOf<FileObserver>()
     @Volatile
     private var pendingAutoDetectChanges: Boolean = false
+    @Volatile
+    private var lastManualCancelTime: Long = 0L
+    @Volatile
+    private var ignoreObserverEventsUntil: Long = 0L
+    private val activelyModifiedLocalPaths = ConcurrentHashMap.newKeySet<String>()
+
+    // In-memory cache of SyncStateStore to avoid decoding/encoding the entire JSON blob after every single file transfer
+    @Volatile
+    private var cachedSyncStateSlot: String? = null
+    @Volatile
+    private var cachedSyncStateStore: SyncStateStore? = null
+    @Volatile
+    private var lastSyncStateFlushMs: Long = 0L
 
     init {
-        reloadFromStorage()
-        ensureBackgroundMonitoringState()
+        scope.launch {
+            reloadFromStorage()
+            ensureBackgroundMonitoringState()
+        }
+        scope.launch {
+            transferRepository.cancelAllEvents.collect {
+                cancelActiveSync(fromNotification = true)
+            }
+        }
     }
 
     private fun slotKey(base: String): String {
@@ -194,42 +221,89 @@ class AutosyncManager @Inject constructor(
     }
 
     private fun loadSyncStateStore(): SyncStateStore {
-        val raw = prefs.getString(slotKey("sync_state_store"), null) ?: return SyncStateStore()
-        return try {
-            json.decodeFromString<SyncStateStore>(raw)
-        } catch (e: Exception) {
-            SyncStateStore()
+        val currentSlot = slotKey("sync_state_store")
+        val existing = cachedSyncStateStore
+        if (existing != null && cachedSyncStateSlot == currentSlot) {
+            return existing
         }
+        val raw = prefs.getString(currentSlot, null)
+        val loaded = if (raw.isNullOrBlank()) {
+            SyncStateStore()
+        } else {
+            try {
+                json.decodeFromString<SyncStateStore>(raw)
+            } catch (e: Exception) {
+                SyncStateStore()
+            }
+        }
+        cachedSyncStateSlot = currentSlot
+        cachedSyncStateStore = loaded
+        return loaded
     }
 
-    private fun saveSyncStateStore(store: SyncStateStore) {
-        prefs.edit().putString(slotKey("sync_state_store"), json.encodeToString(store)).apply()
+    private fun saveSyncStateStore(store: SyncStateStore, forceFlush: Boolean = true) {
+        val currentSlot = slotKey("sync_state_store")
+        cachedSyncStateSlot = currentSlot
+        cachedSyncStateStore = store
+        val now = System.currentTimeMillis()
+        if (forceFlush || now - lastSyncStateFlushMs >= 2_500L) {
+            lastSyncStateFlushMs = now
+            prefs.edit().putString(currentSlot, json.encodeToString(store)).apply()
+        }
     }
 
     fun updateGlobalSettings(transform: (AutosyncGlobalSettings) -> AutosyncGlobalSettings) {
         val updated = transform(_globalSettings.value)
         _globalSettings.value = updated
         saveGlobalSettingsInternal(updated)
+        if (!updated.enableAutosync && _activeStatus.value.isRunning) {
+            cancelActiveSync()
+        }
         ensureBackgroundMonitoringState()
     }
 
     fun saveFolderPair(pair: SyncFolderPair) {
+        // Cancel any active sync so an edited folder pair never keeps uploading to a stale target folder
+        if (_activeStatus.value.isRunning) {
+            cancelActiveSync()
+        }
         val current = _folderPairs.value.toMutableList()
         val idx = current.indexOfFirst { it.id == pair.id }
-        if (idx >= 0) {
-            current[idx] = pair
+        val normalizedPair = if (idx >= 0) {
+            val old = current[idx]
+            if (old.remotePathDisplay.trim() != pair.remotePathDisplay.trim()) {
+                // Reset sync history if destination cloud folder changed so files sync cleanly to the new target
+                scope.launch {
+                    stateMutex.withLock {
+                        val store = loadSyncStateStore()
+                        val updatedMap = store.recordsByPair.toMutableMap()
+                        updatedMap.remove(pair.id)
+                        saveSyncStateStore(store.copy(recordsByPair = updatedMap))
+                    }
+                }
+            }
+            pair
         } else {
-            current.add(pair)
+            pair
+        }
+
+        if (idx >= 0) {
+            current[idx] = normalizedPair
+        } else {
+            current.add(normalizedPair)
         }
         _folderPairs.value = current
         saveFolderPairsInternal(current)
         ensureBackgroundMonitoringState()
-        if (_globalSettings.value.enableAutosync && pair.enabled) {
-            triggerInstantSyncDebounced()
+        if (_globalSettings.value.enableAutosync && normalizedPair.enabled) {
+            triggerInstantSyncDebounced(delayMs = 1200L)
         }
     }
 
     fun deleteFolderPair(pairId: String) {
+        if (_activeStatus.value.isRunning) {
+            cancelActiveSync()
+        }
         val current = _folderPairs.value.filterNot { it.id == pairId }
         _folderPairs.value = current
         saveFolderPairsInternal(current)
@@ -245,15 +319,24 @@ class AutosyncManager @Inject constructor(
     }
 
     fun toggleFolderPairEnabled(pairId: String, enabled: Boolean) {
+        if (!enabled && _activeStatus.value.isRunning && _activeStatus.value.activePairId == pairId) {
+            cancelActiveSync()
+        }
         val current = _folderPairs.value.map {
             if (it.id == pairId) it.copy(enabled = enabled) else it
         }
         _folderPairs.value = current
         saveFolderPairsInternal(current)
         ensureBackgroundMonitoringState()
+        if (enabled && _globalSettings.value.enableAutosync) {
+            triggerInstantSyncDebounced(delayMs = 1200L)
+        }
     }
 
     fun resetFolderPairSyncState(pairId: String) {
+        if (_activeStatus.value.isRunning && _activeStatus.value.activePairId == pairId) {
+            cancelActiveSync()
+        }
         scope.launch {
             stateMutex.withLock {
                 val store = loadSyncStateStore()
@@ -278,8 +361,6 @@ class AutosyncManager @Inject constructor(
         if (settings.enableAutosync && enabledPairs.isNotEmpty()) {
             val isAutoDetectMode = settings.scheduleIntervalMinutes == AutosyncGlobalSettings.SCHEDULE_AUTO_DETECT
             if (isAutoDetectMode) {
-                // Keep a lightweight OS-level WorkManager fallback (60m) in case process is killed by OS,
-                // while in-process Auto Detection handles instant changes without any 5-min polling loop.
                 workerManager.scheduleAutosyncWork(
                     intervalMinutes = 60,
                     wifiOnly = settings.wifiOnly,
@@ -322,111 +403,129 @@ class AutosyncManager @Inject constructor(
         periodicTickerJob = scope.launch {
             while (isActive) {
                 delay(delayMs)
-                if (_globalSettings.value.enableAutosync) {
+                if (_globalSettings.value.enableAutosync && !_activeStatus.value.isRunning) {
                     runScheduledSync(isManual = false, onlyInstantPairs = false)
                 }
             }
         }
     }
 
+    private fun shouldIgnoreObserverTrigger(fullPath: String? = null): Boolean {
+        val now = System.currentTimeMillis()
+        if (now < ignoreObserverEventsUntil) return true
+        if (now - lastManualCancelTime < 5_000L) return true
+        if (fullPath != null && activelyModifiedLocalPaths.contains(fullPath)) return true
+        return false
+    }
+
     private fun registerInstantUploadObservers(monitoredPairs: List<SyncFolderPair>) {
         unregisterInstantUploadObservers()
-        try {
-            val handler = Handler(Looper.getMainLooper())
-            val observer = object : ContentObserver(handler) {
-                override fun onChange(selfChange: Boolean, uri: Uri?) {
-                    super.onChange(selfChange, uri)
-                    pendingAutoDetectChanges = true
-                    triggerInstantSyncDebounced()
+        observerSetupJob = scope.launch(Dispatchers.IO) {
+            try {
+                val handler = Handler(Looper.getMainLooper())
+                val observer = object : ContentObserver(handler) {
+                    override fun onChange(selfChange: Boolean, uri: Uri?) {
+                        super.onChange(selfChange, uri)
+                        if (shouldIgnoreObserverTrigger()) return
+                        pendingAutoDetectChanges = true
+                        triggerInstantSyncDebounced()
+                    }
                 }
-            }
-            val resolver = context.contentResolver
-            resolver.registerContentObserver(MediaStore.Images.Media.EXTERNAL_CONTENT_URI, true, observer)
-            resolver.registerContentObserver(MediaStore.Video.Media.EXTERNAL_CONTENT_URI, true, observer)
-            resolver.registerContentObserver(MediaStore.Audio.Media.EXTERNAL_CONTENT_URI, true, observer)
-            runCatching {
-                resolver.registerContentObserver(MediaStore.Files.getContentUri("external"), true, observer)
-            }
-            mediaContentObserver = observer
+                val resolver = context.contentResolver
+                resolver.registerContentObserver(MediaStore.Images.Media.EXTERNAL_CONTENT_URI, true, observer)
+                resolver.registerContentObserver(MediaStore.Video.Media.EXTERNAL_CONTENT_URI, true, observer)
+                resolver.registerContentObserver(MediaStore.Audio.Media.EXTERNAL_CONTENT_URI, true, observer)
+                runCatching {
+                    resolver.registerContentObserver(MediaStore.Files.getContentUri("external"), true, observer)
+                }
+                mediaContentObserver = observer
 
-            // Attach recursive FileObservers on paired local directories & their subdirectories (capped at 150)
-            val watchedPaths = LinkedHashSet<String>()
-            fun collectWatchableDirs(dir: File, includeChildren: Boolean) {
-                if (watchedPaths.size >= 150 || !dir.exists() || !dir.isDirectory) return
-                val abs = dir.absolutePath
-                if (abs == "/storage/emulated/0" || abs == "/storage/emulated/0/") {
-                    // For full internal storage, watch key top-level user directories + their subfolders
-                    val topDirs = listOf("DCIM", "Pictures", "Download", "Documents", "Movies", "Music", "Recordings", "Android/media")
-                    topDirs.forEach { rel ->
-                        val sub = File(dir, rel)
-                        if (sub.exists() && sub.isDirectory) {
-                            collectWatchableDirs(sub, includeChildren)
+                // Attach recursive FileObservers on paired local directories & their subdirectories (capped at 150) on IO thread
+                val watchedPaths = LinkedHashSet<String>()
+                fun collectWatchableDirs(dir: File, includeChildren: Boolean) {
+                    if (!isActive || watchedPaths.size >= 150 || !dir.exists() || !dir.isDirectory) return
+                    val abs = dir.absolutePath
+                    if (abs == "/storage/emulated/0" || abs == "/storage/emulated/0/") {
+                        val topDirs = listOf("DCIM", "Pictures", "Download", "Documents", "Movies", "Music", "Recordings", "Android/media")
+                        topDirs.forEach { rel ->
+                            val sub = File(dir, rel)
+                            if (sub.exists() && sub.isDirectory) {
+                                collectWatchableDirs(sub, includeChildren)
+                            }
+                        }
+                        return
+                    }
+                    watchedPaths.add(abs)
+                    if (includeChildren && watchedPaths.size < 150) {
+                        val children = dir.listFiles() ?: return
+                        for (child in children) {
+                            if (!isActive || watchedPaths.size >= 150) break
+                            if (child.isDirectory && !child.name.startsWith(".") &&
+                                !child.name.equals(".thumbnails", ignoreCase = true)
+                            ) {
+                                collectWatchableDirs(child, true)
+                            }
                         }
                     }
-                    return
                 }
-                watchedPaths.add(abs)
-                if (includeChildren && watchedPaths.size < 150) {
-                    val children = dir.listFiles() ?: return
-                    for (child in children) {
-                        if (watchedPaths.size >= 150) break
-                        if (child.isDirectory && !child.name.startsWith(".") &&
-                            !child.name.equals(".thumbnails", ignoreCase = true)
+
+                monitoredPairs.forEach { pair ->
+                    if (!isActive) return@launch
+                    val dir = File(pair.localPath)
+                    if (dir.exists() && dir.isDirectory) {
+                        collectWatchableDirs(dir, !pair.excludeSubfolders)
+                    }
+                }
+
+                watchedPaths.forEach { dirPath ->
+                    if (!isActive) return@launch
+                    try {
+                        @Suppress("DEPRECATION")
+                        val fileObs = object : FileObserver(
+                            dirPath,
+                            CLOSE_WRITE or MOVED_TO or CREATE or DELETE or MOVED_FROM
                         ) {
-                            collectWatchableDirs(child, true)
+                            override fun onEvent(event: Int, path: String?) {
+                                if (!path.isNullOrBlank() && !path.startsWith(".") && !path.endsWith(".tmp_download")) {
+                                    val fullFilePath = "$dirPath/$path"
+                                    if (shouldIgnoreObserverTrigger(fullFilePath)) return
+                                    pendingAutoDetectChanges = true
+                                    triggerInstantSyncDebounced()
+                                }
+                            }
                         }
+                        fileObs.startWatching()
+                        synchronized(activeFileObservers) {
+                            activeFileObservers.add(fileObs)
+                        }
+                    } catch (e: Exception) {
+                        Log.w("AutosyncManager", "FileObserver error on $dirPath: ${e.message}")
                     }
                 }
-            }
 
-            monitoredPairs.forEach { pair ->
-                val dir = File(pair.localPath)
-                if (dir.exists() && dir.isDirectory) {
-                    collectWatchableDirs(dir, !pair.excludeSubfolders)
-                }
-            }
-
-            watchedPaths.forEach { dirPath ->
+                // Register NetworkCallback so if files changed while offline, sync starts when network is ready
                 try {
-                    @Suppress("DEPRECATION")
-                    val fileObs = object : FileObserver(
-                        dirPath,
-                        CLOSE_WRITE or MOVED_TO or CREATE or DELETE or MOVED_FROM
-                    ) {
-                        override fun onEvent(event: Int, path: String?) {
-                            if (!path.isNullOrBlank() && !path.startsWith(".")) {
-                                pendingAutoDetectChanges = true
+                    val cm = context.getSystemService(Context.CONNECTIVITY_SERVICE) as ConnectivityManager
+                    val cb = object : ConnectivityManager.NetworkCallback() {
+                        override fun onAvailable(network: android.net.Network) {
+                            super.onAvailable(network)
+                            if (pendingAutoDetectChanges && _globalSettings.value.enableAutosync && !shouldIgnoreObserverTrigger()) {
                                 triggerInstantSyncDebounced()
                             }
                         }
                     }
-                    fileObs.startWatching()
-                    activeFileObservers.add(fileObs)
-                } catch (e: Exception) {
-                    Log.w("AutosyncManager", "FileObserver error on $dirPath: ${e.message}")
-                }
+                    cm.registerDefaultNetworkCallback(cb)
+                    networkCallback = cb
+                } catch (_: Exception) {}
+            } catch (e: Exception) {
+                Log.w("AutosyncManager", "Failed registering instant observers: ${e.message}")
             }
-
-            // Register NetworkCallback so if files changed while offline, sync starts when network is ready
-            try {
-                val cm = context.getSystemService(Context.CONNECTIVITY_SERVICE) as ConnectivityManager
-                val cb = object : ConnectivityManager.NetworkCallback() {
-                    override fun onAvailable(network: android.net.Network) {
-                        super.onAvailable(network)
-                        if (pendingAutoDetectChanges && _globalSettings.value.enableAutosync) {
-                            triggerInstantSyncDebounced()
-                        }
-                    }
-                }
-                cm.registerDefaultNetworkCallback(cb)
-                networkCallback = cb
-            } catch (_: Exception) {}
-        } catch (e: Exception) {
-            Log.w("AutosyncManager", "Failed registering instant observers: ${e.message}")
         }
     }
 
     private fun unregisterInstantUploadObservers() {
+        observerSetupJob?.cancel()
+        observerSetupJob = null
         try {
             mediaContentObserver?.let { context.contentResolver.unregisterContentObserver(it) }
         } catch (_: Exception) {}
@@ -438,19 +537,22 @@ class AutosyncManager @Inject constructor(
         } catch (_: Exception) {}
         networkCallback = null
 
-        activeFileObservers.forEach {
-            try {
-                it.stopWatching()
-            } catch (_: Exception) {}
+        synchronized(activeFileObservers) {
+            activeFileObservers.forEach {
+                try {
+                    it.stopWatching()
+                } catch (_: Exception) {}
+            }
+            activeFileObservers.clear()
         }
-        activeFileObservers.clear()
     }
 
-    private fun triggerInstantSyncDebounced() {
+    private fun triggerInstantSyncDebounced(delayMs: Long = 2800L) {
         if (!_globalSettings.value.enableAutosync) return
         instantDebounceJob?.cancel()
         instantDebounceJob = scope.launch {
-            delay(3500L) // Wait 3.5s for camera/file write to settle
+            delay(delayMs)
+            if (System.currentTimeMillis() - lastManualCancelTime < 5_000L) return@launch
             val isAutoDetectSchedule = _globalSettings.value.scheduleIntervalMinutes == AutosyncGlobalSettings.SCHEDULE_AUTO_DETECT
             val ok = runScheduledSync(isManual = false, onlyInstantPairs = !isAutoDetectSchedule)
             if (ok) {
@@ -473,9 +575,28 @@ class AutosyncManager @Inject constructor(
         }
     }
 
-    fun cancelActiveSync() {
+    fun cancelActiveSync(fromNotification: Boolean = false) {
+        val now = System.currentTimeMillis()
+        lastManualCancelTime = now
+        ignoreObserverEventsUntil = now + 5_000L
+        pendingAutoDetectChanges = false
+
+        instantDebounceJob?.cancel()
+        instantDebounceJob = null
+
         currentSyncJob?.cancel()
         currentSyncJob = null
+
+        activeSyncRunJob?.cancel()
+        activeSyncRunJob = null
+
+        workerManager.cancelRunningManualBackup()
+
+        scope.launch {
+            runCatching { driveRepository.cancelAllSyncTransfers() }
+            runCatching { transferRepository.cancelAllTransfers(notifyExternal = !fromNotification) }
+        }
+
         _activeStatus.value = SyncActiveStatus(
             isRunning = false,
             statusMessage = "Sync cancelled"
@@ -485,61 +606,92 @@ class AutosyncManager @Inject constructor(
     suspend fun runScheduledSync(isManual: Boolean = false, onlyInstantPairs: Boolean = false): Boolean {
         if (syncMutex.isLocked && !isManual) return false
         return syncMutex.withLock {
-            val settings = _globalSettings.value
-            if (!isManual && !settings.enableAutosync) return@withLock false
+            val myJob = coroutineContext[Job]
+            activeSyncRunJob = myJob
+            try {
+                val settings = _globalSettings.value
+                if (!isManual && !settings.enableAutosync) return@withLock false
 
-            val pairsToRun = _folderPairs.value.filter { pair ->
-                if (pair.localPath.isBlank()) {
-                    false
-                } else if (isManual) {
-                    pair.enabled || _folderPairs.value.size == 1
-                } else {
-                    pair.enabled && (!onlyInstantPairs || pair.instantUpload)
+                val pairsToRun = _folderPairs.value.filter { pair ->
+                    if (pair.localPath.isBlank()) {
+                        false
+                    } else if (isManual) {
+                        pair.enabled || _folderPairs.value.size == 1
+                    } else {
+                        pair.enabled && (!onlyInstantPairs || pair.instantUpload)
+                    }
+                }
+                if (pairsToRun.isEmpty()) return@withLock false
+
+                if (!isManual) {
+                    val constraintError = checkAutomaticSyncConstraints(settings)
+                    if (constraintError != null) {
+                        Log.d("AutosyncManager", "Skipping automatic sync due to constraint: $constraintError")
+                        return@withLock false
+                    }
+                }
+
+                var allSucceeded = true
+                for (pair in pairsToRun) {
+                    if (myJob?.isActive == false) break
+                    val latestPair = _folderPairs.value.firstOrNull { it.id == pair.id } ?: continue
+                    if (!isManual && !latestPair.enabled) continue
+                    val ok = executePairWithRetry(latestPair, settings, isManual)
+                    if (!ok) allSucceeded = false
+                }
+
+                val now = System.currentTimeMillis()
+                _lastSyncTime.value = now
+                prefs.edit().putLong(slotKey("last_sync_time"), now).apply()
+                secureSettings.saveLong("last_backup_time", now)
+
+                _activeStatus.value = SyncActiveStatus(
+                    isRunning = false,
+                    statusMessage = if (allSucceeded) "All folders synced" else "Completed with some skipped/failed items"
+                )
+                allSucceeded
+            } catch (ce: CancellationException) {
+                _activeStatus.value = SyncActiveStatus(
+                    isRunning = false,
+                    statusMessage = "Sync cancelled"
+                )
+                throw ce
+            } finally {
+                if (activeSyncRunJob === myJob) {
+                    activeSyncRunJob = null
                 }
             }
-            if (pairsToRun.isEmpty()) return@withLock false
-
-            if (!isManual) {
-                val constraintError = checkAutomaticSyncConstraints(settings)
-                if (constraintError != null) {
-                    Log.d("AutosyncManager", "Skipping automatic sync due to constraint: $constraintError")
-                    return@withLock false
-                }
-            }
-
-            var allSucceeded = true
-            for (pair in pairsToRun) {
-                val ok = executePairWithRetry(pair, settings, isManual)
-                if (!ok) allSucceeded = false
-            }
-
-            val now = System.currentTimeMillis()
-            _lastSyncTime.value = now
-            prefs.edit().putLong(slotKey("last_sync_time"), now).apply()
-            secureSettings.saveLong("last_backup_time", now)
-
-            _activeStatus.value = SyncActiveStatus(
-                isRunning = false,
-                statusMessage = if (allSucceeded) "All folders synced" else "Completed with some skipped/failed items"
-            )
-            allSucceeded
         }
     }
 
     suspend fun runSinglePairSyncSuspend(pairId: String, isManual: Boolean = true): Boolean {
         return syncMutex.withLock {
-            val pair = _folderPairs.value.firstOrNull { it.id == pairId } ?: return@withLock false
-            val settings = _globalSettings.value
-            val ok = executePairWithRetry(pair, settings, isManual)
-            val now = System.currentTimeMillis()
-            _lastSyncTime.value = now
-            prefs.edit().putLong(slotKey("last_sync_time"), now).apply()
-            secureSettings.saveLong("last_backup_time", now)
-            _activeStatus.value = SyncActiveStatus(
-                isRunning = false,
-                statusMessage = if (ok) "Synced ${pair.effectiveTitle}" else "Sync finished with errors"
-            )
-            ok
+            val myJob = coroutineContext[Job]
+            activeSyncRunJob = myJob
+            try {
+                val pair = _folderPairs.value.firstOrNull { it.id == pairId } ?: return@withLock false
+                val settings = _globalSettings.value
+                val ok = executePairWithRetry(pair, settings, isManual)
+                val now = System.currentTimeMillis()
+                _lastSyncTime.value = now
+                prefs.edit().putLong(slotKey("last_sync_time"), now).apply()
+                secureSettings.saveLong("last_backup_time", now)
+                _activeStatus.value = SyncActiveStatus(
+                    isRunning = false,
+                    statusMessage = if (ok) "Synced ${pair.effectiveTitle}" else "Sync finished with errors"
+                )
+                ok
+            } catch (ce: CancellationException) {
+                _activeStatus.value = SyncActiveStatus(
+                    isRunning = false,
+                    statusMessage = "Sync cancelled"
+                )
+                throw ce
+            } finally {
+                if (activeSyncRunJob === myJob) {
+                    activeSyncRunJob = null
+                }
+            }
         }
     }
 
@@ -556,7 +708,8 @@ class AutosyncManager @Inject constructor(
         var attempt = 1
         while (attempt <= maxAttempts) {
             try {
-                val success = executeFolderPairSyncCore(pair, settings, isManual)
+                val latestPair = _folderPairs.value.firstOrNull { it.id == pair.id } ?: return false
+                val success = executeFolderPairSyncCore(latestPair, settings, isManual)
                 if (success) return true
             } catch (ce: CancellationException) {
                 throw ce
@@ -678,7 +831,6 @@ class AutosyncManager @Inject constructor(
             name.equals(".trash", ignoreCase = true)
         ) return true
 
-        // When backing up full internal storage (/storage/emulated/0), skip Android private app caches
         val rootPath = rootDir.absolutePath.trimEnd('/')
         if (rootPath == "/storage/emulated/0") {
             val rel = dir.absolutePath.removePrefix("/storage/emulated/0").trimStart('/')
@@ -709,6 +861,7 @@ class AutosyncManager @Inject constructor(
                         walkDir(child, nextPrefix)
                     }
                 } else if (child.isFile) {
+                    if (child.name.endsWith(".tmp_download")) continue
                     if (pair.excludeHiddenFiles && child.name.startsWith(".")) continue
                     if (child.length() <= 0L) continue
                     if (!matchesFileNameFilter(child.name, pair)) continue
@@ -745,70 +898,67 @@ class AutosyncManager @Inject constructor(
         settings: AutosyncGlobalSettings,
         isManual: Boolean
     ): Boolean {
+        val currentPair = _folderPairs.value.firstOrNull { it.id == pair.id } ?: return false
+        if (!isManual && !currentPair.enabled) return false
+
         _activeStatus.value = SyncActiveStatus(
             isRunning = true,
-            activePairId = pair.id,
-            activePairName = pair.effectiveTitle,
+            activePairId = currentPair.id,
+            activePairName = currentPair.effectiveTitle,
             currentAction = "Scanning folders...",
-            statusMessage = "Preparing ${pair.effectiveTitle}"
+            statusMessage = "Preparing ${currentPair.effectiveTitle}"
         )
 
         val rootChatId = driveRepository.ensureReadyChatIdSuspend()
         if (rootChatId == 0L) {
-            updatePairStatus(pair.id, "Not logged in to Telegram", pair.totalSyncedFiles)
+            updatePairStatus(currentPair.id, "Not logged in to Telegram", currentPair.totalSyncedFiles)
             return false
         }
 
-        val localRoot = File(pair.localPath)
+        val localRoot = File(currentPair.localPath)
         if (!localRoot.exists()) {
             localRoot.mkdirs()
         }
 
-        // Resolve base remote destination
-        var baseChatId = if (pair.remoteChatId == 0L) rootChatId else pair.remoteChatId
-        var baseVfId = pair.remoteVirtualFolderId.ifBlank { "0" }
+        // Always resolve the exact target remote folder matching remotePathDisplay so stale folder IDs are never used
+        val (baseChatId, baseVfId) = driveRepository.resolveSyncTargetFolderSuspend(
+            remotePathDisplay = currentPair.remotePathDisplay,
+            preferredChatId = currentPair.remoteChatId,
+            preferredVfId = currentPair.remoteVirtualFolderId
+        )
 
-        // If user specified a named remote path like "/Camera" but remoteVirtualFolderId is still "0" and chatId is root,
-        // ensure that virtual folder path exists in cloud drive!
-        val cleanRemoteDisplay = pair.remotePathDisplay.trim().trim('/')
-        if (baseVfId == "0" &&
-            (pair.remoteChatId == 0L || pair.remoteChatId == rootChatId) &&
-            cleanRemoteDisplay.isNotEmpty() &&
-            !cleanRemoteDisplay.equals("My Drive", ignoreCase = true) &&
-            !cleanRemoteDisplay.equals("(Root - My Drive)", ignoreCase = true)
-        ) {
-            baseVfId = driveRepository.ensureVirtualFolderPathSuspend(rootChatId, "0", cleanRemoteDisplay)
-            baseChatId = rootChatId
-            // Persist resolved remote IDs back to the pair
-            val updatedPair = pair.copy(remoteChatId = baseChatId, remoteVirtualFolderId = baseVfId)
-            val currentList = _folderPairs.value.map { if (it.id == pair.id) updatedPair else it }
+        if (baseChatId != currentPair.remoteChatId || baseVfId != currentPair.remoteVirtualFolderId) {
+            val updatedPair = currentPair.copy(remoteChatId = baseChatId, remoteVirtualFolderId = baseVfId)
+            val currentList = _folderPairs.value.map { if (it.id == currentPair.id) updatedPair else it }
             _folderPairs.value = currentList
             saveFolderPairsInternal(currentList)
         }
 
-        val includeSubfolders = !pair.excludeSubfolders
-        val localFilesMap = collectLocalFiles(localRoot, pair)
+        val includeSubfolders = !currentPair.excludeSubfolders
+        val localFilesMap = collectLocalFiles(localRoot, currentPair)
         val remoteFilesList = driveRepository.getRemoteTreeFilesForSyncSuspend(
             baseChatId = baseChatId,
             baseVirtualFolderId = baseVfId,
             includeSubfolders = includeSubfolders
-        ).filter { (relPath, entity) ->
+        ).filter { (_, entity) ->
             val fileName = entity.name
-            !(pair.excludeHiddenFiles && fileName.startsWith(".")) &&
-                matchesFileNameFilter(fileName, pair)
+            !(currentPair.excludeHiddenFiles && fileName.startsWith(".")) &&
+                matchesFileNameFilter(fileName, currentPair)
         }
 
-        // Keep newest remote entity per relative path
+        // Group all remote entities by relative path (so deleting a file deletes all duplicate copies on remote)
+        val remoteEntitiesByPath = LinkedHashMap<String, MutableList<DriveItemEntity>>()
         val remoteFilesMap = LinkedHashMap<String, DriveItemEntity>()
         remoteFilesList.forEach { (relPath, entity) ->
+            remoteEntitiesByPath.getOrPut(relPath) { mutableListOf() }.add(entity)
             val existing = remoteFilesMap[relPath]
-            if (existing == null || entity.createdAt > existing.createdAt) {
+            if (existing == null || entity.createdAt >= existing.createdAt) {
                 remoteFilesMap[relPath] = entity
             }
         }
 
         val previousRecords = stateMutex.withLock {
-            loadSyncStateStore().recordsByPair[pair.id]?.toMutableMap() ?: mutableMapOf()
+            loadSyncStateStore().recordsByPair[currentPair.id]?.toMutableMap() ?: mutableMapOf()
         }
         val newRecords = ConcurrentHashMap<String, SyncedFileRecord>(previousRecords)
 
@@ -816,9 +966,9 @@ class AutosyncManager @Inject constructor(
         val toUpload = mutableListOf<Pair<String, File>>()
         val toDownload = mutableListOf<Pair<String, DriveItemEntity>>()
         val toDeleteLocal = mutableListOf<Pair<String, File>>()
-        val toDeleteRemote = mutableListOf<Pair<String, DriveItemEntity>>()
+        val toDeleteRemote = mutableListOf<Pair<String, List<DriveItemEntity>>>()
 
-        when (pair.syncMethod) {
+        when (currentPair.syncMethod) {
             SyncMethod.UPLOAD_ONLY -> {
                 for ((relPath, localFile) in localFilesMap) {
                     val remoteEntity = remoteFilesMap[relPath]
@@ -831,7 +981,7 @@ class AutosyncManager @Inject constructor(
                         if (isFileSizeAllowed(localFile.length(), isUpload = true, settings = settings)) {
                             toUpload.add(relPath to localFile)
                         }
-                    } else if (prev == null && remoteEntity != null) {
+                    } else if (remoteEntity != null) {
                         newRecords[relPath] = SyncedFileRecord(
                             relativePath = relPath,
                             localSize = localFile.length(),
@@ -849,7 +999,6 @@ class AutosyncManager @Inject constructor(
                 for ((relPath, localFile) in localFilesMap) {
                     val remoteEntity = remoteFilesMap[relPath]
                     if (remoteEntity != null && remoteEntity.size == localFile.length()) {
-                        // Already in cloud with matching size -> safe to delete local copy
                         toDeleteLocal.add(relPath to localFile)
                     } else if (isFileSizeAllowed(localFile.length(), isUpload = true, settings = settings)) {
                         toUpload.add(relPath to localFile)
@@ -862,13 +1011,26 @@ class AutosyncManager @Inject constructor(
                     val remoteEntity = remoteFilesMap[relPath]
                     if (remoteEntity == null || remoteEntity.size != localFile.length()) {
                         if (isFileSizeAllowed(localFile.length(), isUpload = true, settings = settings)) {
+                            if (remoteEntity != null) {
+                                toDeleteRemote.add(relPath to (remoteEntitiesByPath[relPath] ?: listOf(remoteEntity)))
+                            }
                             toUpload.add(relPath to localFile)
                         }
+                    } else {
+                        newRecords[relPath] = SyncedFileRecord(
+                            relativePath = relPath,
+                            localSize = localFile.length(),
+                            localLastModified = localFile.lastModified(),
+                            originalTimestamp = remoteEntity.createdAt,
+                            remoteMessageId = remoteEntity.id,
+                            remoteChatId = remoteEntity.parentChatId,
+                            remoteVirtualFolderId = remoteEntity.virtualParentId ?: baseVfId
+                        )
                     }
                 }
                 for ((relPath, remoteEntity) in remoteFilesMap) {
                     if (!localFilesMap.containsKey(relPath)) {
-                        toDeleteRemote.add(relPath to remoteEntity)
+                        toDeleteRemote.add(relPath to (remoteEntitiesByPath[relPath] ?: listOf(remoteEntity)))
                     }
                 }
             }
@@ -880,6 +1042,16 @@ class AutosyncManager @Inject constructor(
                         if (isFileSizeAllowed(remoteEntity.size, isUpload = false, settings = settings)) {
                             toDownload.add(relPath to remoteEntity)
                         }
+                    } else {
+                        newRecords[relPath] = SyncedFileRecord(
+                            relativePath = relPath,
+                            localSize = localFile.length(),
+                            localLastModified = localFile.lastModified(),
+                            originalTimestamp = remoteEntity.createdAt,
+                            remoteMessageId = remoteEntity.id,
+                            remoteChatId = remoteEntity.parentChatId,
+                            remoteVirtualFolderId = remoteEntity.virtualParentId ?: baseVfId
+                        )
                     }
                 }
             }
@@ -888,8 +1060,7 @@ class AutosyncManager @Inject constructor(
                 for ((relPath, remoteEntity) in remoteFilesMap) {
                     val localFile = localFilesMap[relPath]
                     if (localFile != null && localFile.length() == remoteEntity.size) {
-                        // Already downloaded -> delete from remote
-                        toDeleteRemote.add(relPath to remoteEntity)
+                        toDeleteRemote.add(relPath to (remoteEntitiesByPath[relPath] ?: listOf(remoteEntity)))
                     } else if (isFileSizeAllowed(remoteEntity.size, isUpload = false, settings = settings)) {
                         toDownload.add(relPath to remoteEntity)
                     }
@@ -903,6 +1074,16 @@ class AutosyncManager @Inject constructor(
                         if (isFileSizeAllowed(remoteEntity.size, isUpload = false, settings = settings)) {
                             toDownload.add(relPath to remoteEntity)
                         }
+                    } else {
+                        newRecords[relPath] = SyncedFileRecord(
+                            relativePath = relPath,
+                            localSize = localFile.length(),
+                            localLastModified = localFile.lastModified(),
+                            originalTimestamp = remoteEntity.createdAt,
+                            remoteMessageId = remoteEntity.id,
+                            remoteChatId = remoteEntity.parentChatId,
+                            remoteVirtualFolderId = remoteEntity.virtualParentId ?: baseVfId
+                        )
                     }
                 }
                 for ((relPath, localFile) in localFilesMap) {
@@ -918,6 +1099,7 @@ class AutosyncManager @Inject constructor(
                     val localFile = localFilesMap[relPath]
                     val remoteEntity = remoteFilesMap[relPath]
                     val prev = previousRecords[relPath]
+                    val expectedLocalPath = File(localRoot, relPath).absolutePath
 
                     when {
                         localFile != null && remoteEntity == null -> {
@@ -930,9 +1112,11 @@ class AutosyncManager @Inject constructor(
                             }
                         }
                         localFile == null && remoteEntity != null -> {
-                            if (prev != null) {
-                                // Was previously synced, now deleted locally -> delete on remote
-                                toDeleteRemote.add(relPath to remoteEntity)
+                            val wasUploadedFromThisLocalPath = !remoteEntity.localPath.isNullOrBlank() &&
+                                File(remoteEntity.localPath).absolutePath == expectedLocalPath
+                            if (prev != null || wasUploadedFromThisLocalPath) {
+                                // Was previously synced (or uploaded from this exact local path), now deleted locally -> delete on remote
+                                toDeleteRemote.add(relPath to (remoteEntitiesByPath[relPath] ?: listOf(remoteEntity)))
                             } else if (isFileSizeAllowed(remoteEntity.size, isUpload = false, settings = settings)) {
                                 // New cloud file -> download to device
                                 toDownload.add(relPath to remoteEntity)
@@ -943,7 +1127,7 @@ class AutosyncManager @Inject constructor(
                                 val localOrigTime = FileUtils.extractOriginalTimestampMillis(localFile)
                                 if (localOrigTime >= remoteEntity.createdAt) {
                                     if (isFileSizeAllowed(localFile.length(), isUpload = true, settings = settings)) {
-                                        toDeleteRemote.add(relPath to remoteEntity)
+                                        toDeleteRemote.add(relPath to (remoteEntitiesByPath[relPath] ?: listOf(remoteEntity)))
                                         toUpload.add(relPath to localFile)
                                     }
                                 } else {
@@ -951,7 +1135,7 @@ class AutosyncManager @Inject constructor(
                                         toDownload.add(relPath to remoteEntity)
                                     }
                                 }
-                            } else if (prev == null) {
+                            } else {
                                 newRecords[relPath] = SyncedFileRecord(
                                     relativePath = relPath,
                                     localSize = localFile.length(),
@@ -971,15 +1155,17 @@ class AutosyncManager @Inject constructor(
             }
         }
 
+        // Persist matched baseline records immediately so even if sync is interrupted later, existing matched files are remembered
+        savePairRecords(currentPair.id, newRecords, forceFlush = true)
+
         val totalOperations = toUpload.size + toDownload.size + toDeleteLocal.size + toDeleteRemote.size
         val completedOps = AtomicInteger(0)
-        var failedCount = AtomicInteger(0)
+        val failedCount = AtomicInteger(0)
 
         if (totalOperations == 0) {
-            savePairRecords(pair.id, newRecords)
             val totalFilesCount = maxOf(localFilesMap.size, remoteFilesMap.size)
             val timeStr = SimpleDateFormat("dd MMM, hh:mm a", Locale.getDefault()).format(Date())
-            updatePairStatus(pair.id, "Up to date ($timeStr)", totalFilesCount)
+            updatePairStatus(currentPair.id, "Up to date ($timeStr)", totalFilesCount)
             return true
         }
 
@@ -1004,75 +1190,125 @@ class AutosyncManager @Inject constructor(
             }
         }
 
-        // 1. Execute Deletions first (for Mirror / Two-way)
-        for ((relPath, remoteEntity) in toDeleteRemote) {
+        fun ensurePairStillActive(): Boolean {
+            val latest = _folderPairs.value.firstOrNull { it.id == currentPair.id } ?: return false
+            if (!isManual && !latest.enabled) return false
+            if (latest.remotePathDisplay.trim() != currentPair.remotePathDisplay.trim()) return false
+            return true
+        }
+
+        // 1. Execute Remote Deletions first (for Mirror / Two-way)
+        for ((relPath, remoteEntities) in toDeleteRemote) {
+            if (!ensurePairStillActive()) throw CancellationException("Folder pair modified or disabled")
             val step = completedOps.incrementAndGet()
+            val primaryName = remoteEntities.firstOrNull()?.name ?: relPath.substringAfterLast('/')
             _activeStatus.value = SyncActiveStatus(
                 isRunning = true,
-                activePairId = pair.id,
-                activePairName = pair.effectiveTitle,
-                currentFileName = remoteEntity.name,
-                currentAction = "Removing from cloud",
+                activePairId = currentPair.id,
+                activePairName = currentPair.effectiveTitle,
+                currentFileName = primaryName,
+                currentAction = "Removing from cloud ($step/$totalOperations)",
                 processedCount = step,
                 totalCount = totalOperations,
                 progress = step.toFloat() / totalOperations.toFloat()
             )
-            try {
-                driveRepository.deleteRemoteFileForSyncSuspend(remoteEntity.id, remoteEntity.parentChatId)
+            var deletedAny = false
+            for (entity in remoteEntities) {
+                try {
+                    driveRepository.deleteRemoteFileForSyncSuspend(entity.id, entity.parentChatId)
+                    deletedAny = true
+                } catch (_: Exception) {}
+            }
+            if (deletedAny) {
                 newRecords.remove(relPath)
-            } catch (e: Exception) {
+                savePairRecords(currentPair.id, newRecords)
+            } else {
                 failedCount.incrementAndGet()
             }
         }
 
+        // 2. Execute Local Deletions
         for ((relPath, localFile) in toDeleteLocal) {
+            if (!ensurePairStillActive()) throw CancellationException("Folder pair modified or disabled")
             val step = completedOps.incrementAndGet()
             _activeStatus.value = SyncActiveStatus(
                 isRunning = true,
-                activePairId = pair.id,
-                activePairName = pair.effectiveTitle,
+                activePairId = currentPair.id,
+                activePairName = currentPair.effectiveTitle,
                 currentFileName = localFile.name,
-                currentAction = "Removing from device",
+                currentAction = "Removing from device ($step/$totalOperations)",
                 processedCount = step,
                 totalCount = totalOperations,
                 progress = step.toFloat() / totalOperations.toFloat()
             )
+            val absPath = localFile.absolutePath
+            activelyModifiedLocalPaths.add(absPath)
+            ignoreObserverEventsUntil = System.currentTimeMillis() + 4_000L
             try {
-                if (localFile.delete()) {
+                if (!localFile.exists() || localFile.delete()) {
                     FileUtils.restoreOriginalTimestampAndScan(context, localFile, 0L)
+                    newRecords.remove(relPath)
+                    savePairRecords(currentPair.id, newRecords)
+                } else {
+                    failedCount.incrementAndGet()
                 }
-                newRecords.remove(relPath)
             } catch (e: Exception) {
                 failedCount.incrementAndGet()
+            } finally {
+                activelyModifiedLocalPaths.remove(absPath)
             }
         }
 
-        // 2. Execute Uploads (with optional parallelism)
-        val uploadPermits = if (settings.allowParallelUploads) 3 else 1
+        // 3. Execute Uploads (bounded parallelism with live file progress & incremental record saving)
+        val uploadPermits = if (settings.allowParallelUploads) 2 else 1
         val uploadSemaphore = Semaphore(uploadPermits)
+        val startedUploads = AtomicInteger(0)
         coroutineScope {
             toUpload.map { (relPath, localFile) ->
                 async {
                     uploadSemaphore.withPermit {
-                        val step = completedOps.incrementAndGet()
+                        if (!ensurePairStillActive()) throw CancellationException("Folder pair modified or disabled")
+                        val currentIndex = ( completedOps.get() + startedUploads.incrementAndGet() ).coerceAtMost(totalOperations)
                         _activeStatus.value = SyncActiveStatus(
                             isRunning = true,
-                            activePairId = pair.id,
-                            activePairName = pair.effectiveTitle,
+                            activePairId = currentPair.id,
+                            activePairName = currentPair.effectiveTitle,
                             currentFileName = localFile.name,
-                            currentAction = "Uploading",
-                            processedCount = step,
+                            currentAction = "Uploading ($currentIndex/$totalOperations)",
+                            processedCount = completedOps.get(),
                             totalCount = totalOperations,
-                            progress = step.toFloat() / totalOperations.toFloat()
+                            progress = (completedOps.get().toFloat() / totalOperations.toFloat()).coerceIn(0f, 1f)
                         )
                         val targetVfId = resolveRemoteVfForRelativePath(relPath)
                         val origTs = FileUtils.extractOriginalTimestampMillis(localFile)
+                        var lastProgressEmitMs = 0L
                         val msgId = driveRepository.uploadFileForSyncSuspend(
                             localFile = localFile,
                             targetChatId = baseChatId,
                             targetVirtualFolderId = targetVfId,
-                            originalTimestampMillis = origTs
+                            originalTimestampMillis = origTs,
+                            onProgress = { fileFraction ->
+                                val nowMs = System.currentTimeMillis()
+                                if (nowMs - lastProgressEmitMs >= 200L || fileFraction >= 0.99f) {
+                                    lastProgressEmitMs = nowMs
+                                    val doneBefore = completedOps.get().toFloat()
+                                    val combinedProgress = ((doneBefore + fileFraction) / totalOperations.toFloat()).coerceIn(0f, 0.99f)
+                                    val pct = (fileFraction * 100f).toInt().coerceIn(0, 100)
+                                    _activeStatus.value = SyncActiveStatus(
+                                        isRunning = true,
+                                        activePairId = currentPair.id,
+                                        activePairName = currentPair.effectiveTitle,
+                                        currentFileName = "${localFile.name} ($pct%)",
+                                        currentAction = "Uploading ($currentIndex/$totalOperations)",
+                                        processedCount = currentIndex,
+                                        totalCount = totalOperations,
+                                        progress = combinedProgress
+                                    )
+                                }
+                            }
                         )
+                        val finishedStep = completedOps.incrementAndGet()
+                        startedUploads.decrementAndGet()
                         if (msgId != null) {
                             newRecords[relPath] = SyncedFileRecord(
                                 relativePath = relPath,
@@ -1083,42 +1319,93 @@ class AutosyncManager @Inject constructor(
                                 remoteChatId = baseChatId,
                                 remoteVirtualFolderId = targetVfId
                             )
-                            if (pair.syncMethod == SyncMethod.UPLOAD_THEN_DELETE) {
+                            if (currentPair.syncMethod == SyncMethod.UPLOAD_THEN_DELETE) {
+                                val absPath = localFile.absolutePath
+                                activelyModifiedLocalPaths.add(absPath)
+                                ignoreObserverEventsUntil = System.currentTimeMillis() + 4_000L
                                 try {
-                                    localFile.delete()
-                                } catch (_: Exception) {}
+                                    if (localFile.delete()) {
+                                        FileUtils.restoreOriginalTimestampAndScan(context, localFile, 0L)
+                                    }
+                                } catch (_: Exception) {
+                                } finally {
+                                    activelyModifiedLocalPaths.remove(absPath)
+                                }
                             }
+                            savePairRecords(currentPair.id, newRecords)
                         } else {
                             failedCount.incrementAndGet()
                         }
+                        _activeStatus.value = SyncActiveStatus(
+                            isRunning = true,
+                            activePairId = currentPair.id,
+                            activePairName = currentPair.effectiveTitle,
+                            currentFileName = localFile.name,
+                            currentAction = "Uploaded ($finishedStep/$totalOperations)",
+                            processedCount = finishedStep,
+                            totalCount = totalOperations,
+                            progress = (finishedStep.toFloat() / totalOperations.toFloat()).coerceIn(0f, 1f)
+                        )
                     }
                 }
             }.awaitAll()
         }
 
-        // 3. Execute Downloads (with optional parallelism)
-        val downloadPermits = if (settings.allowParallelDownloads) 3 else 1
+        // 4. Execute Downloads (bounded parallelism with live file progress & observer guard)
+        val downloadPermits = if (settings.allowParallelDownloads) 2 else 1
         val downloadSemaphore = Semaphore(downloadPermits)
+        val startedDownloads = AtomicInteger(0)
         coroutineScope {
             toDownload.map { (relPath, remoteEntity) ->
                 async {
                     downloadSemaphore.withPermit {
-                        val step = completedOps.incrementAndGet()
+                        if (!ensurePairStillActive()) throw CancellationException("Folder pair modified or disabled")
+                        val currentIndex = (completedOps.get() + startedDownloads.incrementAndGet()).coerceAtMost(totalOperations)
                         _activeStatus.value = SyncActiveStatus(
                             isRunning = true,
-                            activePairId = pair.id,
-                            activePairName = pair.effectiveTitle,
+                            activePairId = currentPair.id,
+                            activePairName = currentPair.effectiveTitle,
                             currentFileName = remoteEntity.name,
-                            currentAction = "Downloading",
-                            processedCount = step,
+                            currentAction = "Downloading ($currentIndex/$totalOperations)",
+                            processedCount = completedOps.get(),
                             totalCount = totalOperations,
-                            progress = step.toFloat() / totalOperations.toFloat()
+                            progress = (completedOps.get().toFloat() / totalOperations.toFloat()).coerceIn(0f, 1f)
                         )
                         val destFile = File(localRoot, relPath)
-                        val ok = driveRepository.downloadFileForSyncSuspend(
-                            fileEntity = remoteEntity,
-                            destLocalFile = destFile
-                        )
+                        val absPath = destFile.absolutePath
+                        activelyModifiedLocalPaths.add(absPath)
+                        ignoreObserverEventsUntil = System.currentTimeMillis() + 5_000L
+                        var lastDlProgressEmitMs = 0L
+                        val ok = try {
+                            driveRepository.downloadFileForSyncSuspend(
+                                fileEntity = remoteEntity,
+                                destLocalFile = destFile,
+                                onProgress = { fileFraction ->
+                                    val nowMs = System.currentTimeMillis()
+                                    if (nowMs - lastDlProgressEmitMs >= 200L || fileFraction >= 0.99f) {
+                                        lastDlProgressEmitMs = nowMs
+                                        val doneBefore = completedOps.get().toFloat()
+                                        val combinedProgress = ((doneBefore + fileFraction) / totalOperations.toFloat()).coerceIn(0f, 0.99f)
+                                        val pct = (fileFraction * 100f).toInt().coerceIn(0, 100)
+                                        _activeStatus.value = SyncActiveStatus(
+                                            isRunning = true,
+                                            activePairId = currentPair.id,
+                                            activePairName = currentPair.effectiveTitle,
+                                            currentFileName = "${remoteEntity.name} ($pct%)",
+                                            currentAction = "Downloading ($currentIndex/$totalOperations)",
+                                            processedCount = currentIndex,
+                                            totalCount = totalOperations,
+                                            progress = combinedProgress
+                                        )
+                                    }
+                                }
+                            )
+                        } finally {
+                            ignoreObserverEventsUntil = System.currentTimeMillis() + 4_000L
+                            activelyModifiedLocalPaths.remove(absPath)
+                        }
+                        val finishedStep = completedOps.incrementAndGet()
+                        startedDownloads.decrementAndGet()
                         if (ok) {
                             newRecords[relPath] = SyncedFileRecord(
                                 relativePath = relPath,
@@ -1129,41 +1416,61 @@ class AutosyncManager @Inject constructor(
                                 remoteChatId = remoteEntity.parentChatId,
                                 remoteVirtualFolderId = remoteEntity.virtualParentId ?: baseVfId
                             )
-                            if (pair.syncMethod == SyncMethod.DOWNLOAD_THEN_DELETE) {
-                                try {
-                                    driveRepository.deleteRemoteFileForSyncSuspend(remoteEntity.id, remoteEntity.parentChatId)
-                                } catch (_: Exception) {}
+                            if (currentPair.syncMethod == SyncMethod.DOWNLOAD_THEN_DELETE) {
+                                val allCopies = remoteEntitiesByPath[relPath] ?: listOf(remoteEntity)
+                                for (copy in allCopies) {
+                                    try {
+                                        driveRepository.deleteRemoteFileForSyncSuspend(copy.id, copy.parentChatId)
+                                    } catch (_: Exception) {}
+                                }
                             }
+                            savePairRecords(currentPair.id, newRecords)
                         } else {
                             failedCount.incrementAndGet()
                         }
+                        _activeStatus.value = SyncActiveStatus(
+                            isRunning = true,
+                            activePairId = currentPair.id,
+                            activePairName = currentPair.effectiveTitle,
+                            currentFileName = remoteEntity.name,
+                            currentAction = "Downloaded ($finishedStep/$totalOperations)",
+                            processedCount = finishedStep,
+                            totalCount = totalOperations,
+                            progress = (finishedStep.toFloat() / totalOperations.toFloat()).coerceIn(0f, 1f)
+                        )
                     }
                 }
             }.awaitAll()
         }
 
-        if (pair.deleteEmptySubfolders) {
+        if (currentPair.deleteEmptySubfolders) {
+            ignoreObserverEventsUntil = System.currentTimeMillis() + 4_000L
             cleanupEmptyLocalSubfolders(localRoot)
         }
 
-        savePairRecords(pair.id, newRecords)
+        savePairRecords(currentPair.id, newRecords, forceFlush = true)
+        if (toUpload.isNotEmpty() || toDeleteRemote.isNotEmpty() || currentPair.syncMethod == SyncMethod.DOWNLOAD_THEN_DELETE) {
+            runCatching { driveRepository.flushSyncManifest() }
+        }
 
         val timeStr = SimpleDateFormat("dd MMM, hh:mm a", Locale.getDefault()).format(Date())
         val finalStatus = if (failedCount.get() == 0) {
-            "Synced ($timeStr) • ↑${toUpload.size} ↓${toDownload.size}"
+            val delCount = toDeleteLocal.size + toDeleteRemote.size
+            val delSuffix = if (delCount > 0) " ✕$delCount" else ""
+            "Synced ($timeStr) • ↑${toUpload.size} ↓${toDownload.size}$delSuffix"
         } else {
             "Partial sync ($timeStr) • ${failedCount.get()} failed"
         }
-        updatePairStatus(pair.id, finalStatus, newRecords.size)
+        updatePairStatus(currentPair.id, finalStatus, newRecords.size)
         return failedCount.get() == 0
     }
 
-    private suspend fun savePairRecords(pairId: String, records: Map<String, SyncedFileRecord>) {
+    private suspend fun savePairRecords(pairId: String, records: Map<String, SyncedFileRecord>, forceFlush: Boolean = false) {
         stateMutex.withLock {
             val store = loadSyncStateStore()
             val updated = store.recordsByPair.toMutableMap()
             updated[pairId] = records.toMap()
-            saveSyncStateStore(store.copy(recordsByPair = updated))
+            saveSyncStateStore(store.copy(recordsByPair = updated), forceFlush = forceFlush)
         }
     }
 

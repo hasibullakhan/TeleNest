@@ -14,8 +14,8 @@ android {
     applicationId = "com.awd.teledrive"
     minSdk = 24
     targetSdk = 36
-    versionCode = 42
-    versionName = "3.1.0"
+    versionCode = 44
+    versionName = "3.3.0"
 
     testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"
     ndk {

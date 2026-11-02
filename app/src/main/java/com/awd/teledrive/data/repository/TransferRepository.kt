@@ -22,6 +22,7 @@ import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.SharingStarted
 import kotlinx.coroutines.flow.StateFlow
+import kotlinx.coroutines.flow.asSharedFlow
 import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.flow.map
 import kotlinx.coroutines.flow.stateIn
@@ -66,6 +67,9 @@ class TransferRepository @Inject constructor(
     private val dbMutex = Mutex()
 
     private val scope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
+
+    private val _cancelAllEvents = kotlinx.coroutines.flow.MutableSharedFlow<Unit>(extraBufferCapacity = 4)
+    val cancelAllEvents: kotlinx.coroutines.flow.SharedFlow<Unit> = _cancelAllEvents.asSharedFlow()
 
     // In-memory preview transfer state so opening files in PreviewScreen never triggers phantom notification bar downloads
     private val _previewTransfers = MutableStateFlow<Map<String, TransferInfo>>(emptyMap())
@@ -600,6 +604,9 @@ class TransferRepository @Inject constructor(
     }
 
     fun cancelTransfer(uniqueId: String) {
+        if (uniqueId.startsWith("sync_")) {
+            _cancelAllEvents.tryEmit(Unit)
+        }
         scope.launch {
             var foundInQueue = false
             synchronized(queue) {
@@ -632,6 +639,42 @@ class TransferRepository @Inject constructor(
                 if (activeTransferId == uniqueId) {
                     activeTransferId = null
                     processQueue()
+                }
+            }
+        }
+    }
+
+    fun cancelAllTransfers(notifyExternal: Boolean = true) {
+        if (notifyExternal) {
+            _cancelAllEvents.tryEmit(Unit)
+        }
+        synchronized(queue) {
+            queue.clear()
+            activeTransferId = null
+            completionDeferreds.values.forEach { it.complete(Unit) }
+            completionDeferreds.clear()
+            idMigrationMap.clear()
+        }
+        scope.launch {
+            dbMutex.withLock {
+                try {
+                    val activeItems = transfers.value.values.filter {
+                        it.status == Status.DOWNLOADING ||
+                            it.status == Status.UPLOADING ||
+                            it.status == Status.QUEUED
+                    }
+                    activeItems.forEach { item ->
+                        if (item.fileId != 0) {
+                            if (item.isDownload) {
+                                telegramClient.send(org.drinkless.tdlib.TdApi.CancelDownloadFile(item.fileId, true))
+                            } else {
+                                telegramClient.send(org.drinkless.tdlib.TdApi.CancelPreliminaryUploadFile(item.fileId))
+                            }
+                        }
+                    }
+                    transferDao.clearAll()
+                } catch (e: Exception) {
+                    Log.e("TransferRepo", "Error cancelling all transfers: ${e.message}")
                 }
             }
         }

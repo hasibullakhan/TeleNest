@@ -7,9 +7,12 @@ import com.awd.teledrive.data.secure.SecureSessionManager
 import com.awd.teledrive.domain.model.DriveItem
 import com.awd.teledrive.domain.model.MoveCopyDestination
 import dagger.hilt.android.lifecycle.HiltViewModel
+import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.flow.SharingStarted
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.combine
+import kotlinx.coroutines.flow.distinctUntilChanged
+import kotlinx.coroutines.flow.flowOn
 import kotlinx.coroutines.flow.map
 import kotlinx.coroutines.flow.stateIn
 import kotlinx.coroutines.launch
@@ -30,8 +33,17 @@ class MediaViewModel @Inject constructor(
         items.filter {
             (it.mimeType.startsWith("image/") || it.mimeType.startsWith("video/")) &&
             (secureActive || !it.isEncrypted)
-        }.sortedByDescending { it.createdAt }
-    }.stateIn(viewModelScope, SharingStarted.WhileSubscribed(5000), emptyList())
+        }.sortedByDescending { if (it.createdAt > 0L) it.createdAt else it.id }
+    }
+        .distinctUntilChanged()
+        .flowOn(Dispatchers.Default)
+        .stateIn(viewModelScope, SharingStarted.WhileSubscribed(5000), emptyList())
+
+    val mediaSections: StateFlow<List<MediaDateSection>> = mediaItems
+        .map { items -> groupMediaChronologicallyFast(items) }
+        .distinctUntilChanged()
+        .flowOn(Dispatchers.Default)
+        .stateIn(viewModelScope, SharingStarted.WhileSubscribed(5000), emptyList())
 
     val folders: StateFlow<List<DriveItem.Folder>> = driveRepository.getAllAvailableFolders()
         .stateIn(viewModelScope, SharingStarted.WhileSubscribed(5000), emptyList())

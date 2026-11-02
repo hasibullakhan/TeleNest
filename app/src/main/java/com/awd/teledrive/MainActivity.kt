@@ -370,11 +370,13 @@ class MainActivity : AppCompatActivity() {
         handleShareIntent(intent)
         checkAndRequestPermissions()
 
-        try {
-            autosyncManager.reloadFromStorage()
-            autosyncManager.ensureBackgroundMonitoringState()
-        } catch (e: Exception) {
-            e.printStackTrace()
+        kotlinx.coroutines.CoroutineScope(kotlinx.coroutines.Dispatchers.IO + kotlinx.coroutines.SupervisorJob()).launch {
+            try {
+                autosyncManager.reloadFromStorage()
+                autosyncManager.ensureBackgroundMonitoringState()
+            } catch (e: Exception) {
+                e.printStackTrace()
+            }
         }
 
         lifecycle.addObserver(

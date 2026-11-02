@@ -67,6 +67,14 @@ class TeleDriveWorkerManager @Inject constructor(
         }
     }
 
+    fun cancelRunningManualBackup() {
+        try {
+            WorkManager.getInstance(context).cancelUniqueWork("manual_backup_worker")
+        } catch (e: Exception) {
+            e.printStackTrace()
+        }
+    }
+
     fun scheduleBackup(enabled: Boolean) {
         if (!enabled) {
             cancelPeriodicBackup()

@@ -7,14 +7,14 @@
 **A Native, Privacy-First Unlimited Cloud Drive for Android Powered by Telegram MTProto & TDLib**
 
 [![Latest Release](https://img.shields.io/github/v/release/hasibullakhan/TeleNest?style=for-the-badge&logo=github&color=0088CC)](https://github.com/hasibullakhan/TeleNest/releases/latest)
-[![Download APK](https://img.shields.io/badge/Download-APK%20v3.1.0-24A1DE?style=for-the-badge&logo=android&logoColor=white)](https://github.com/hasibullakhan/TeleNest/releases/latest/download/TeleNest-v3.1.0.apk)
+[![Download APK](https://img.shields.io/badge/Download-APK%20v3.3.0-24A1DE?style=for-the-badge&logo=android&logoColor=white)](https://github.com/hasibullakhan/TeleNest/releases/latest/download/TeleNest-v3.3.0.apk)
 [![Platform](https://img.shields.io/badge/Platform-Android%207.0%2B%20(API%2024%2B)-3DDC84?style=for-the-badge&logo=android&logoColor=white)](https://developer.android.com)
 [![Kotlin](https://img.shields.io/badge/Kotlin-2.0-7F52FF?style=for-the-badge&logo=kotlin&logoColor=white)](https://kotlinlang.org)
 [![Jetpack Compose](https://img.shields.io/badge/UI-Jetpack%20Compose%20M3-4285F4?style=for-the-badge&logo=jetpackcompose&logoColor=white)](https://developer.android.com/jetpack/compose)
 [![Encryption](https://img.shields.io/badge/Security-AES--256--GCM%20%7C%20Argon2-E11D48?style=for-the-badge&logo=shield&logoColor=white)](https://github.com/hasibullakhan/TeleNest)
 [![License: MIT](https://img.shields.io/badge/License-MIT-F59E0B?style=for-the-badge)](LICENSE)
 
-[**Download Latest APK (v3.1.0)**](https://github.com/hasibullakhan/TeleNest/releases/latest) • [**Full Feature Guide**](#-detailed-features--capabilities) • [**Report a Bug**](https://github.com/hasibullakhan/TeleNest/issues) • [**Request a Feature**](https://github.com/hasibullakhan/TeleNest/issues) • [**Author Profile**](https://www.facebook.com/HasibullaKhanHK)
+[**Download Latest APK (v3.3.0)**](https://github.com/hasibullakhan/TeleNest/releases/latest) • [**Full Feature Guide**](#-detailed-features--capabilities) • [**Report a Bug**](https://github.com/hasibullakhan/TeleNest/issues) • [**Request a Feature**](https://github.com/hasibullakhan/TeleNest/issues) • [**Author Profile**](https://www.facebook.com/HasibullaKhanHK)
 
 </div>
 
@@ -88,21 +88,29 @@ Unlike third-party bots, web wrappers, or cloud middleman services that risk you
 
 ---
 
-### 🔄 5. Advanced AutoSync & Folder Pairs Engine
-TeleNest features a full-fledged folder synchronization engine inspired by AutoSync, allowing you to pair any local phone directory (or entire internal storage) with any Telegram cloud folder:
-- **5 Versatile Sync Methods:**
-  - 🔄 **Two-way sync:** Keeps device and cloud folders in sync. New/updated files transfer both ways, deletions propagate seamlessly.
-  - ⬆️ **Upload only:** Uploads new/modified local files to the cloud. Deletions on device are preserved in cloud.
-  - 📦 **Upload then delete:** Uploads new files and safely deletes local copies to free up internal phone storage.
-  - 🪞 **Mirror:** Cloud is an exact mirror of local folder. Any files removed locally are removed from cloud.
-  - ⬇️ **Download:** Downloads new cloud files to local device.
-- **Instant Upload & Real-time File Observers:** Detects new photos, recordings, or downloads immediately upon saving and syncs without delay.
-- **Granular Filter & Safety Controls:**
-  - Exclude hidden files & folders (`.nomedia`, dotfiles).
-  - Exclude subfolders or auto-sync all subdirectories recursively.
-  - Delete empty subfolders automatically after synchronization.
-  - Filter by file name or extension (e.g. `*.jpg`, `*.pdf`, `*.mp4`).
-- **Flexible Network & Power Conditions:** Configurable sync triggers for **Wi-Fi only**, **Charging only**, battery level constraints, and custom sync intervals (from 5 minutes to daily).
+### 🔄 5. Advanced AutoSync & Folder Pairs Engine (7 Sync Modes)
+TeleNest includes a dedicated folder synchronization engine inspired by Autosync (`com.ttxapps.autosync`), allowing you to pair any local phone folder (or your entire Internal Storage) with any Telegram Cloud Drive folder:
+- **7 Complete Sync Methods (English & Bengali Descriptions):**
+  - 🔄 **Two-way:** Syncs additions, modifications, and deletions in both directions between device and cloud.
+  - ⬆️ **Upload only:** Uploads new and modified local files to the cloud while keeping cloud files safe if deleted locally.
+  - 📤 **Upload then delete:** Uploads local files to the cloud and automatically deletes the local copy to free up phone storage.
+  - 🪞 **Upload mirror:** Makes the cloud folder an exact mirror of the local folder (files deleted on phone are removed from cloud).
+  - ⬇️ **Download only:** Downloads new files from the cloud folder to the device while keeping local files if deleted in cloud.
+  - 📥 **Download then delete:** Downloads files from the cloud folder to the phone and automatically deletes them from the cloud folder.
+  - 📲 **Download mirror:** Makes the local folder an exact mirror of the cloud folder (files deleted in cloud are removed from phone).
+- **Hierarchical Cloud & Device Folder Pickers:** Drill down step-by-step into parent and nested subfolders just like a native file manager—never cluttered with flat subfolder lists.
+- **Original Capture Timestamp Preservation (`[ORIG_TS:]` + EXIF):** Preserves the exact original capture/creation date of photos, videos, and documents during both uploads and downloads so gallery ordering never breaks.
+- **Instant Auto-Detection & Real-Time Observers:** Combines Android `ContentObserver` (MediaStore), recursive `FileObserver` (up to 150 directories on background I/O threads), and `NetworkCallback` to sync changes automatically within seconds.
+- **Granular Sync Conditions:** Wi-Fi only, metered Wi-Fi control, roaming guard, charging-only mode, minimum battery threshold, per-file size limits, parallel transfers, and custom schedules.
+
+---
+
+### 🚀 6. High-Speed 60fps/120fps Performance Architecture (v3.3.0)
+- **Indexed SQLite + Write-Ahead Logging (WAL):** 12 composite and secondary Room indexes on `drive_items` and `transfers` with `WRITE_AHEAD_LOGGING` enabled so background sync writes never block UI reads.
+- **Batched Thumbnail & File Path Pipeline:** Coalesces high-frequency TDLib file/thumbnail callbacks into single database transactions (`180ms` window), eliminating recomposition storms when loading large media folders.
+- **Instant Folder Navigation & Smart Cooldown Cache:** Serves folder contents immediately from indexed Room cache with zero artificial delay while refreshing cloud changes silently in the background.
+- **Tuned Coil Image & Video Frame Engine:** Configured with a 25% RAM `MemoryCache`, 250 MB `DiskCache`, `RGB_565` bitmap decoding, `Precision.INEXACT` thumbnail sizing, and bounded 4-thread parallel frame decoding.
+- **Off-Main-Thread Chronological Media Grouping:** Pre-computes Google Photos-style date sections on `Dispatchers.Default` reusing a single `Calendar` instance for instant tab switching.
 
 ---
 

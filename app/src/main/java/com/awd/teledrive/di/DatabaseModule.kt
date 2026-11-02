@@ -53,6 +53,23 @@ class AccountDatabaseManager @Inject constructor(
         }
     }
 
+    private val migration6To7 = object : Migration(6, 7) {
+        override fun migrate(db: SupportSQLiteDatabase) {
+            db.execSQL("CREATE INDEX IF NOT EXISTS `idx_drive_items_folder_lookup` ON `drive_items` (`parentChatId`, `virtualParentId`, `isTrashed`, `createdAt`)")
+            db.execSQL("CREATE INDEX IF NOT EXISTS `idx_drive_items_type_trash_date` ON `drive_items` (`isFolder`, `isTrashed`, `createdAt`)")
+            db.execSQL("CREATE INDEX IF NOT EXISTS `idx_drive_items_remote_uid` ON `drive_items` (`remoteUniqueId`)")
+            db.execSQL("CREATE INDEX IF NOT EXISTS `idx_drive_items_thumb_uid` ON `drive_items` (`thumbnailRemoteUniqueId`)")
+            db.execSQL("CREATE INDEX IF NOT EXISTS `idx_drive_items_virtual_id` ON `drive_items` (`virtualId`)")
+            db.execSQL("CREATE INDEX IF NOT EXISTS `idx_drive_items_virtual_parent` ON `drive_items` (`virtualParentId`)")
+            db.execSQL("CREATE INDEX IF NOT EXISTS `idx_drive_items_starred` ON `drive_items` (`isStarred`, `isTrashed`)")
+            db.execSQL("CREATE INDEX IF NOT EXISTS `idx_drive_items_offline` ON `drive_items` (`isOffline`, `isTrashed`)")
+            db.execSQL("CREATE INDEX IF NOT EXISTS `idx_drive_items_split_group` ON `drive_items` (`splitGroupId`, `parentChatId`)")
+            db.execSQL("CREATE INDEX IF NOT EXISTS `idx_transfers_file_id` ON `transfers` (`fileId`)")
+            db.execSQL("CREATE INDEX IF NOT EXISTS `idx_transfers_local_path` ON `transfers` (`localPath`)")
+            db.execSQL("CREATE INDEX IF NOT EXISTS `idx_transfers_status` ON `transfers` (`status`)")
+        }
+    }
+
     private fun getDatabaseName(slotId: String): String {
         val clean = slotId.ifBlank { "default" }
         return if (clean == "default") "teledrive.db" else "teledrive_$clean.db"
@@ -68,7 +85,8 @@ class AccountDatabaseManager @Inject constructor(
             TeleDriveDatabase::class.java,
             dbName
         )
-            .addMigrations(migration5To6)
+            .setJournalMode(androidx.room.RoomDatabase.JournalMode.WRITE_AHEAD_LOGGING)
+            .addMigrations(migration5To6, migration6To7)
             .fallbackToDestructiveMigration(true)
             .build()
         databases[clean] = built
@@ -145,6 +163,9 @@ private class SwitchableDriveDao(
     override suspend fun getItemById(id: Long, parentChatId: Long): DriveItemEntity? =
         currentDao().getItemById(id, parentChatId)
 
+    override suspend fun getItemsByIdsInChat(parentChatId: Long, ids: List<Long>): List<DriveItemEntity> =
+        currentDao().getItemsByIdsInChat(parentChatId, ids)
+
     override suspend fun getVirtualFolderById(virtualId: String): DriveItemEntity? =
         currentDao().getVirtualFolderById(virtualId)
 
@@ -168,6 +189,9 @@ private class SwitchableDriveDao(
 
     override suspend fun updateFileAndThumbnailPathIfChanged(uniqueId: String, path: String): Int =
         currentDao().updateFileAndThumbnailPathIfChanged(uniqueId, path)
+
+    override suspend fun updateFileAndThumbnailPathsBatch(updates: Map<String, String>): Int =
+        currentDao().updateFileAndThumbnailPathsBatch(updates)
 
     override suspend fun updateStarred(id: Long, parentChatId: Long, isStarred: Boolean) =
         currentDao().updateStarred(id, parentChatId, isStarred)
@@ -207,6 +231,12 @@ private class SwitchableDriveDao(
 
     override suspend fun deleteItemsByChat(chatId: Long) =
         currentDao().deleteItemsByChat(chatId)
+
+    override suspend fun getActiveFileIdsByChatSync(chatId: Long): List<Long> =
+        currentDao().getActiveFileIdsByChatSync(chatId)
+
+    override suspend fun deleteActiveFilesByIdsInChat(chatId: Long, idsToDelete: List<Long>) =
+        currentDao().deleteActiveFilesByIdsInChat(chatId, idsToDelete)
 
     override suspend fun deleteFilesByChatNotInList(chatId: Long, keepIds: List<Long>) =
         currentDao().deleteFilesByChatNotInList(chatId, keepIds)

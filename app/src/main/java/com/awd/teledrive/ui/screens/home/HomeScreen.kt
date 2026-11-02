@@ -308,7 +308,7 @@ fun HomeScreen(
         onToggleStarred = viewModel::toggleStarred,
         onNavigateToFolder = { chatId, vId, name -> viewModel.navigateToFolder(chatId, vId, name) },
         onNavigateBack = viewModel::navigateBack,
-        onRefresh = viewModel::fetchItems,
+        onRefresh = viewModel::refreshItems,
         onRenameItem = viewModel::renameItem,
         onSetFolderColor = viewModel::setFolderColor,
         onCancelTransfer = viewModel::cancelTransfer,
@@ -649,20 +649,22 @@ fun HomeContent(
         "${userProfile?.slotId ?: "default"}_${currentFolderId ?: "root"}_${currentVirtualFolderId}_${currentSection.name}"
     }
 
-    // Continuously preserve scroll state of current active folder
+    // Preserve scroll state when scrolling settles (instead of mutating the map on every single scroll pixel)
     LaunchedEffect(listState, currentFolderKey) {
-        snapshotFlow { Pair(listState.firstVisibleItemIndex, listState.firstVisibleItemScrollOffset) }
-            .collect { pos ->
-                if (items.isNotEmpty()) {
-                    folderScrollPositions["list_$currentFolderKey"] = pos
+        snapshotFlow { listState.isScrollInProgress }
+            .collect { isScrolling ->
+                if (!isScrolling && items.isNotEmpty()) {
+                    folderScrollPositions["list_$currentFolderKey"] =
+                        Pair(listState.firstVisibleItemIndex, listState.firstVisibleItemScrollOffset)
                 }
             }
     }
     LaunchedEffect(gridState, currentFolderKey) {
-        snapshotFlow { Pair(gridState.firstVisibleItemIndex, gridState.firstVisibleItemScrollOffset) }
-            .collect { pos ->
-                if (items.isNotEmpty()) {
-                    folderScrollPositions["grid_$currentFolderKey"] = pos
+        snapshotFlow { gridState.isScrollInProgress }
+            .collect { isScrolling ->
+                if (!isScrolling && items.isNotEmpty()) {
+                    folderScrollPositions["grid_$currentFolderKey"] =
+                        Pair(gridState.firstVisibleItemIndex, gridState.firstVisibleItemScrollOffset)
                 }
             }
     }
@@ -4244,10 +4246,15 @@ fun DriveListItem(
 
     val listImageRequest = remember(thumbnailModel) {
         thumbnailModel?.let {
+            val cacheKey = "list_thumb_$it"
             ImageRequest.Builder(context)
                 .data(it)
                 .size(140)
-                .crossfade(true)
+                .precision(coil.size.Precision.INEXACT)
+                .allowRgb565(true)
+                .memoryCacheKey(cacheKey)
+                .diskCacheKey(cacheKey)
+                .crossfade(100)
                 .build()
         }
     }
@@ -4806,10 +4813,15 @@ fun DriveGridItem(
 
     val gridImageRequest = remember(thumbnailModel) {
         thumbnailModel?.let {
+            val cacheKey = "grid_thumb_$it"
             ImageRequest.Builder(context)
                 .data(it)
                 .size(320)
-                .crossfade(true)
+                .precision(coil.size.Precision.INEXACT)
+                .allowRgb565(true)
+                .memoryCacheKey(cacheKey)
+                .diskCacheKey(cacheKey)
+                .crossfade(100)
                 .build()
         }
     }

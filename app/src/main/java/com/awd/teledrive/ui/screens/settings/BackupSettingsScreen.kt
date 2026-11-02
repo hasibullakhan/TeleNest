@@ -1395,31 +1395,151 @@ private fun FullScreenRemoteFolderPicker(
     onSelect: (DriveRepository.RemoteFolderOption) -> Unit,
     onCancel: () -> Unit
 ) {
-    var searchQuery by remember { mutableStateOf("") }
-    var highlightedOption by remember(remoteFolders, currentPath) {
-        mutableStateOf(
-            remoteFolders.firstOrNull { it.fullPath == currentPath }
-                ?: remoteFolders.firstOrNull()
-        )
+    val rootOption = remember(remoteFolders) {
+        remoteFolders.firstOrNull { it.folderKey == "ROOT" || it.fullPath == "/" }
+            ?: DriveRepository.RemoteFolderOption(
+                displayName = "/ (Root - My Drive)",
+                fullPath = "/",
+                chatId = 0L,
+                virtualFolderId = "0",
+                parentVirtualId = "0",
+                folderKey = "ROOT",
+                parentFolderKey = ""
+            )
     }
+
+    var searchQuery by remember { mutableStateOf("") }
+    var currentFolder by remember {
+        val cleanTarget = currentPath.trim()
+        val initial = if (cleanTarget.isNotEmpty() && cleanTarget != "/") {
+            remoteFolders.firstOrNull { it.fullPath.equals(cleanTarget, ignoreCase = true) } ?: rootOption
+        } else {
+            rootOption
+        }
+        mutableStateOf(initial)
+    }
+    var hasInitializedFromPath by remember { mutableStateOf(currentFolder.folderKey != "ROOT" || currentPath.isBlank() || currentPath == "/") }
+
+    LaunchedEffect(remoteFolders, currentPath) {
+        if (remoteFolders.isNotEmpty()) {
+            // Keep currentFolder synced with refreshed remoteFolders
+            val updatedCurrent = remoteFolders.firstOrNull { it.folderKey == currentFolder.folderKey }
+                ?: remoteFolders.firstOrNull { it.fullPath.equals(currentFolder.fullPath, ignoreCase = true) }
+            if (updatedCurrent != null) {
+                currentFolder = updatedCurrent
+            }
+            if (!hasInitializedFromPath && currentPath.isNotBlank() && currentPath != "/") {
+                val match = remoteFolders.firstOrNull { it.fullPath.equals(currentPath.trim(), ignoreCase = true) }
+                if (match != null) {
+                    currentFolder = match
+                    hasInitializedFromPath = true
+                }
+            }
+        }
+    }
+
+    val folderByKey = remember(remoteFolders, rootOption) {
+        val map = LinkedHashMap<String, DriveRepository.RemoteFolderOption>()
+        map["ROOT"] = rootOption
+        remoteFolders.forEach { map[it.folderKey] = it }
+        map
+    }
+
+    // Build breadcrumb chain from ROOT to currentFolder
+    val breadcrumbs = remember(currentFolder, folderByKey, rootOption) {
+        val chain = mutableListOf<DriveRepository.RemoteFolderOption>()
+        var cursor: DriveRepository.RemoteFolderOption? = currentFolder
+        val visited = HashSet<String>()
+        while (cursor != null && visited.add(cursor.folderKey)) {
+            chain.add(0, cursor)
+            if (cursor.folderKey == "ROOT" || cursor.parentFolderKey.isBlank()) break
+            cursor = folderByKey[cursor.parentFolderKey] ?: rootOption
+        }
+        if (chain.isEmpty() || chain.first().folderKey != "ROOT") {
+            chain.add(0, rootOption)
+        }
+        chain
+    }
+
+    // Direct children of currentFolder (strictly 1 level deep!)
+    val directChildFolders = remember(remoteFolders, currentFolder) {
+        val seenNames = HashSet<String>()
+        remoteFolders
+            .filter { option ->
+                option.folderKey != "ROOT" &&
+                    option.fullPath != "/" &&
+                    option.parentFolderKey == currentFolder.folderKey
+            }
+            .sortedBy { it.displayName.trim().lowercase() }
+            .filter { option ->
+                seenNames.add(option.displayName.trim().lowercase())
+            }
+    }
+
+    // Count of direct subfolders per folderKey so user can see which folders contain inner subfolders
+    val childCountByFolderKey = remember(remoteFolders) {
+        val counts = HashMap<String, Int>()
+        val seenPairs = HashSet<String>()
+        remoteFolders.forEach { opt ->
+            if (opt.folderKey != "ROOT" && opt.parentFolderKey.isNotBlank()) {
+                val dedupKey = "${opt.parentFolderKey}::${opt.displayName.trim().lowercase()}"
+                if (seenPairs.add(dedupKey)) {
+                    counts[opt.parentFolderKey] = (counts[opt.parentFolderKey] ?: 0) + 1
+                }
+            }
+        }
+        counts
+    }
+
+    val searchResults = remember(remoteFolders, searchQuery) {
+        val q = searchQuery.trim()
+        if (q.isEmpty()) {
+            emptyList()
+        } else {
+            remoteFolders.filter {
+                it.folderKey != "ROOT" &&
+                    (it.displayName.contains(q, ignoreCase = true) || it.fullPath.contains(q, ignoreCase = true))
+            }.sortedBy { it.fullPath.lowercase() }
+        }
+    }
+
+    fun navigateUpOneLevel() {
+        if (searchQuery.isNotBlank()) {
+            searchQuery = ""
+            return
+        }
+        if (currentFolder.folderKey != "ROOT") {
+            val parent = folderByKey[currentFolder.parentFolderKey] ?: rootOption
+            currentFolder = parent
+        } else {
+            onCancel()
+        }
+    }
+
+    // Intercept system back button to go up one folder level when inside a subfolder
+    BackHandler {
+        navigateUpOneLevel()
+    }
+
     var showCreateSubDialog by remember { mutableStateOf(false) }
     var newFolderNameInput by remember { mutableStateOf("") }
 
-    LaunchedEffect(remoteFolders) {
-        if (highlightedOption == null && remoteFolders.isNotEmpty()) {
-            highlightedOption = remoteFolders.first()
+    val formattedCurrentFolder = remember(currentFolder) {
+        if (currentFolder.folderKey == "ROOT" || currentFolder.fullPath == "/") {
+            "/ (Root - My Drive)"
+        } else {
+            currentFolder.fullPath
         }
     }
 
     if (showCreateSubDialog) {
-        val parentLabel = highlightedOption?.fullPath ?: "/ (Root)"
         AlertDialog(
             onDismissRequest = { showCreateSubDialog = false },
             title = { Text("Create New Cloud Folder") },
             text = {
                 Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
                     Text(
-                        text = "Inside: ${if (parentLabel == "/") "/ (Root - My Drive)" else parentLabel}",
+                        text = "Inside: $formattedCurrentFolder",
                         style = MaterialTheme.typography.bodySmall,
                         color = MaterialTheme.colorScheme.onSurfaceVariant
                     )
@@ -1439,15 +1559,14 @@ private fun FullScreenRemoteFolderPicker(
                         val name = newFolderNameInput.trim()
                         if (name.isNotEmpty()) {
                             showCreateSubDialog = false
-                            onCreateFolder(name, highlightedOption) { created ->
-                                highlightedOption = created
-                                onSelect(created)
+                            onCreateFolder(name, currentFolder) { created ->
+                                currentFolder = created
                             }
                             newFolderNameInput = ""
                         }
                     }
                 ) {
-                    Text("Create & Select")
+                    Text("Create")
                 }
             },
             dismissButton = {
@@ -1469,9 +1588,7 @@ private fun FullScreenRemoteFolderPicker(
                             fontWeight = FontWeight.Bold
                         )
                         Text(
-                            text = highlightedOption?.let {
-                                if (it.fullPath == "/") "/ (Root - My Drive)" else it.fullPath
-                            } ?: "Tap a folder below to select",
+                            text = formattedCurrentFolder,
                             style = MaterialTheme.typography.bodySmall,
                             color = MaterialTheme.colorScheme.primary,
                             maxLines = 1,
@@ -1486,6 +1603,12 @@ private fun FullScreenRemoteFolderPicker(
                     }
                 },
                 actions = {
+                    IconButton(
+                        onClick = { navigateUpOneLevel() },
+                        enabled = currentFolder.folderKey != "ROOT"
+                    ) {
+                        Icon(Icons.AutoMirrored.Filled.ArrowBack, contentDescription = "Up Folder")
+                    }
                     IconButton(onClick = { showCreateSubDialog = true }) {
                         Icon(Icons.Default.CreateNewFolder, contentDescription = "Create New Cloud Folder")
                     }
@@ -1503,35 +1626,38 @@ private fun FullScreenRemoteFolderPicker(
                     .fillMaxWidth()
                     .navigationBarsPadding()
             ) {
-                Row(
+                Column(
                     modifier = Modifier
                         .fillMaxWidth()
                         .padding(horizontal = 16.dp, vertical = 10.dp),
-                    horizontalArrangement = Arrangement.spacedBy(10.dp),
-                    verticalAlignment = Alignment.CenterVertically
+                    verticalArrangement = Arrangement.spacedBy(6.dp)
                 ) {
-                    OutlinedButton(
-                        onClick = onCancel,
-                        modifier = Modifier.weight(1f)
+                    Text(
+                        text = "Selected: $formattedCurrentFolder",
+                        style = MaterialTheme.typography.labelMedium,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant,
+                        maxLines = 1,
+                        overflow = TextOverflow.Ellipsis
+                    )
+                    Row(
+                        modifier = Modifier.fillMaxWidth(),
+                        horizontalArrangement = Arrangement.spacedBy(10.dp),
+                        verticalAlignment = Alignment.CenterVertically
                     ) {
-                        Text("Cancel")
-                    }
-                    Button(
-                        onClick = {
-                            val chosen = highlightedOption ?: DriveRepository.RemoteFolderOption(
-                                displayName = "/ (Root - My Drive)",
-                                fullPath = "/",
-                                chatId = 0L,
-                                virtualFolderId = "0",
-                                parentVirtualId = "0"
-                            )
-                            onSelect(chosen)
-                        },
-                        modifier = Modifier.weight(1.4f)
-                    ) {
-                        Icon(Icons.Default.Check, contentDescription = null, modifier = Modifier.size(18.dp))
-                        Spacer(modifier = Modifier.width(6.dp))
-                        Text("Select Folder")
+                        OutlinedButton(
+                            onClick = onCancel,
+                            modifier = Modifier.weight(1f)
+                        ) {
+                            Text("Cancel")
+                        }
+                        Button(
+                            onClick = { onSelect(currentFolder) },
+                            modifier = Modifier.weight(1.5f)
+                        ) {
+                            Icon(Icons.Default.Check, contentDescription = null, modifier = Modifier.size(18.dp))
+                            Spacer(modifier = Modifier.width(6.dp))
+                            Text("Select This Folder")
+                        }
                     }
                 }
             }
@@ -1541,29 +1667,94 @@ private fun FullScreenRemoteFolderPicker(
             modifier = Modifier
                 .fillMaxSize()
                 .padding(padding)
-                .padding(horizontal = 16.dp, vertical = 8.dp),
+                .padding(horizontal = 16.dp, vertical = 6.dp),
             verticalArrangement = Arrangement.spacedBy(8.dp)
         ) {
+            // Search field
+            OutlinedTextField(
+                value = searchQuery,
+                onValueChange = { searchQuery = it },
+                placeholder = { Text("Search cloud folders...") },
+                singleLine = true,
+                shape = RoundedCornerShape(10.dp),
+                trailingIcon = {
+                    if (searchQuery.isNotEmpty()) {
+                        IconButton(onClick = { searchQuery = "" }) {
+                            Icon(Icons.Default.Close, contentDescription = "Clear search")
+                        }
+                    }
+                },
+                modifier = Modifier.fillMaxWidth()
+            )
+
+            // Clickable Breadcrumb bar (shows current folder hierarchy clearly)
+            Row(
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .horizontalScroll(rememberScrollState()),
+                horizontalArrangement = Arrangement.spacedBy(6.dp),
+                verticalAlignment = Alignment.CenterVertically
+            ) {
+                breadcrumbs.forEachIndexed { index, crumb ->
+                    val isCurrent = crumb.folderKey == currentFolder.folderKey
+                    val label = if (crumb.folderKey == "ROOT" || crumb.fullPath == "/") {
+                        "My Drive (/)"
+                    } else {
+                        crumb.displayName
+                    }
+                    AssistChip(
+                        onClick = {
+                            searchQuery = ""
+                            currentFolder = crumb
+                        },
+                        leadingIcon = {
+                            Icon(
+                                imageVector = if (crumb.folderKey == "ROOT") Icons.Default.Cloud else Icons.Default.FolderOpen,
+                                contentDescription = null,
+                                modifier = Modifier.size(16.dp),
+                                tint = if (isCurrent) MaterialTheme.colorScheme.primary else MaterialTheme.colorScheme.onSurfaceVariant
+                            )
+                        },
+                        label = {
+                            Text(
+                                text = label,
+                                fontWeight = if (isCurrent) FontWeight.Bold else FontWeight.Normal
+                            )
+                        }
+                    )
+                    if (index < breadcrumbs.lastIndex) {
+                        Text(
+                            text = "›",
+                            style = MaterialTheme.typography.titleMedium,
+                            color = MaterialTheme.colorScheme.onSurfaceVariant
+                        )
+                    }
+                }
+            }
+
+            // Up Folder & New Folder action row (identical feel to Local Folder Picker)
             Row(
                 horizontalArrangement = Arrangement.spacedBy(8.dp),
-                verticalAlignment = Alignment.CenterVertically,
                 modifier = Modifier.fillMaxWidth()
             ) {
-                OutlinedTextField(
-                    value = searchQuery,
-                    onValueChange = { searchQuery = it },
-                    placeholder = { Text("Search cloud folders...") },
-                    singleLine = true,
-                    shape = RoundedCornerShape(10.dp),
-                    modifier = Modifier.weight(1f)
-                )
+                OutlinedButton(
+                    onClick = { navigateUpOneLevel() },
+                    enabled = currentFolder.folderKey != "ROOT" || searchQuery.isNotBlank(),
+                    modifier = Modifier.weight(1f),
+                    contentPadding = PaddingValues(horizontal = 10.dp, vertical = 8.dp)
+                ) {
+                    Icon(Icons.AutoMirrored.Filled.ArrowBack, contentDescription = null, modifier = Modifier.size(16.dp))
+                    Spacer(modifier = Modifier.width(6.dp))
+                    Text("Up Folder")
+                }
                 OutlinedButton(
                     onClick = { showCreateSubDialog = true },
-                    contentPadding = PaddingValues(horizontal = 12.dp, vertical = 14.dp)
+                    modifier = Modifier.weight(1f),
+                    contentPadding = PaddingValues(horizontal = 10.dp, vertical = 8.dp)
                 ) {
-                    Icon(Icons.Default.CreateNewFolder, contentDescription = null, modifier = Modifier.size(18.dp))
+                    Icon(Icons.Default.CreateNewFolder, contentDescription = null, modifier = Modifier.size(16.dp))
                     Spacer(modifier = Modifier.width(6.dp))
-                    Text("New")
+                    Text("New Folder")
                 }
             }
 
@@ -1576,12 +1767,8 @@ private fun FullScreenRemoteFolderPicker(
                 ) {
                     CircularProgressIndicator()
                 }
-            } else {
-                val filtered = remoteFolders.filter {
-                    searchQuery.isBlank() ||
-                        it.fullPath.contains(searchQuery, ignoreCase = true) ||
-                        it.displayName.contains(searchQuery, ignoreCase = true)
-                }
+            } else if (searchQuery.isNotBlank()) {
+                // Search mode: show matching folders with option to open or select
                 LazyColumn(
                     modifier = Modifier
                         .fillMaxWidth()
@@ -1589,56 +1776,188 @@ private fun FullScreenRemoteFolderPicker(
                     verticalArrangement = Arrangement.spacedBy(6.dp),
                     contentPadding = PaddingValues(vertical = 4.dp)
                 ) {
-                    items(filtered, key = { "${it.chatId}_${it.virtualFolderId}_${it.fullPath}" }) { option ->
-                        val isSelected = highlightedOption?.fullPath == option.fullPath
-                        Surface(
-                            shape = RoundedCornerShape(10.dp),
-                            border = BorderStroke(
-                                width = if (isSelected) 1.5.dp else 1.dp,
-                                color = if (isSelected) MaterialTheme.colorScheme.primary else MaterialTheme.colorScheme.outlineVariant
-                            ),
-                            color = if (isSelected) {
-                                MaterialTheme.colorScheme.primaryContainer.copy(alpha = 0.3f)
-                            } else {
-                                MaterialTheme.colorScheme.surface
-                            },
-                            modifier = Modifier
-                                .fillMaxWidth()
-                                .clickable {
-                                    highlightedOption = option
-                                    onSelect(option)
-                                }
-                        ) {
-                            Row(
-                                verticalAlignment = Alignment.CenterVertically,
+                    if (searchResults.isEmpty()) {
+                        item {
+                            OutlinedCard(
+                                shape = RoundedCornerShape(10.dp),
                                 modifier = Modifier
                                     .fillMaxWidth()
-                                    .padding(horizontal = 14.dp, vertical = 12.dp)
+                                    .padding(vertical = 16.dp)
                             ) {
-                                Icon(
-                                    imageVector = if (option.fullPath == "/") Icons.Default.Cloud else Icons.Default.Folder,
-                                    contentDescription = null,
-                                    tint = if (isSelected) MaterialTheme.colorScheme.primary else MaterialTheme.colorScheme.onSurfaceVariant
-                                )
-                                Spacer(modifier = Modifier.width(12.dp))
-                                Column(modifier = Modifier.weight(1f)) {
-                                    Text(
-                                        text = if (option.fullPath == "/") "/ (Root - My Drive)" else option.fullPath,
-                                        style = MaterialTheme.typography.bodyLarge,
-                                        fontWeight = if (isSelected) FontWeight.Bold else FontWeight.Medium
+                                Column(
+                                    modifier = Modifier
+                                        .fillMaxWidth()
+                                        .padding(20.dp),
+                                    horizontalAlignment = Alignment.CenterHorizontally
+                                ) {
+                                    Icon(
+                                        imageVector = Icons.Default.FolderOpen,
+                                        contentDescription = null,
+                                        tint = MaterialTheme.colorScheme.primary,
+                                        modifier = Modifier.size(36.dp)
                                     )
+                                    Spacer(modifier = Modifier.height(8.dp))
                                     Text(
-                                        text = if (option.fullPath == "/") "Main Telegram Cloud Drive Root" else "Cloud Folder: ${option.displayName}",
+                                        text = "No cloud folders matching '$searchQuery'",
+                                        style = MaterialTheme.typography.titleSmall,
+                                        fontWeight = FontWeight.SemiBold
+                                    )
+                                }
+                            }
+                        }
+                    } else {
+                        items(searchResults, key = { it.folderKey }) { option ->
+                            val subCount = childCountByFolderKey[option.folderKey] ?: 0
+                            Surface(
+                                shape = RoundedCornerShape(10.dp),
+                                border = BorderStroke(1.dp, MaterialTheme.colorScheme.outlineVariant),
+                                color = MaterialTheme.colorScheme.surface,
+                                modifier = Modifier
+                                    .fillMaxWidth()
+                                    .clickable {
+                                        searchQuery = ""
+                                        currentFolder = option
+                                    }
+                            ) {
+                                Row(
+                                    verticalAlignment = Alignment.CenterVertically,
+                                    modifier = Modifier
+                                        .fillMaxWidth()
+                                        .padding(horizontal = 14.dp, vertical = 11.dp)
+                                ) {
+                                    Icon(
+                                        imageVector = Icons.Default.Folder,
+                                        contentDescription = null,
+                                        tint = MaterialTheme.colorScheme.primary
+                                    )
+                                    Spacer(modifier = Modifier.width(12.dp))
+                                    Column(modifier = Modifier.weight(1f)) {
+                                        Text(
+                                            text = option.displayName,
+                                            style = MaterialTheme.typography.bodyLarge,
+                                            fontWeight = FontWeight.Medium,
+                                            maxLines = 1,
+                                            overflow = TextOverflow.Ellipsis
+                                        )
+                                        Text(
+                                            text = if (subCount > 0) "${option.fullPath} • $subCount subfolder(s)" else option.fullPath,
+                                            style = MaterialTheme.typography.bodySmall,
+                                            color = MaterialTheme.colorScheme.onSurfaceVariant,
+                                            maxLines = 1,
+                                            overflow = TextOverflow.Ellipsis
+                                        )
+                                    }
+                                    TextButton(
+                                        onClick = { onSelect(option) },
+                                        contentPadding = PaddingValues(horizontal = 8.dp, vertical = 2.dp)
+                                    ) {
+                                        Text("Select", style = MaterialTheme.typography.labelMedium)
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            } else {
+                // Hierarchical directory mode: ONLY show direct subfolders of currentFolder!
+                LazyColumn(
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .weight(1f),
+                    verticalArrangement = Arrangement.spacedBy(6.dp),
+                    contentPadding = PaddingValues(vertical = 4.dp)
+                ) {
+                    if (directChildFolders.isEmpty()) {
+                        item {
+                            OutlinedCard(
+                                shape = RoundedCornerShape(10.dp),
+                                modifier = Modifier
+                                    .fillMaxWidth()
+                                    .padding(vertical = 16.dp)
+                            ) {
+                                Column(
+                                    modifier = Modifier
+                                        .fillMaxWidth()
+                                        .padding(20.dp),
+                                    horizontalAlignment = Alignment.CenterHorizontally
+                                ) {
+                                    Icon(
+                                        imageVector = Icons.Default.FolderOpen,
+                                        contentDescription = null,
+                                        tint = MaterialTheme.colorScheme.primary,
+                                        modifier = Modifier.size(36.dp)
+                                    )
+                                    Spacer(modifier = Modifier.height(8.dp))
+                                    Text(
+                                        text = if (currentFolder.folderKey == "ROOT") {
+                                            "No cloud folders in My Drive yet"
+                                        } else {
+                                            "No subfolders inside '${currentFolder.displayName}'"
+                                        },
+                                        style = MaterialTheme.typography.titleSmall,
+                                        fontWeight = FontWeight.SemiBold
+                                    )
+                                    Spacer(modifier = Modifier.height(4.dp))
+                                    Text(
+                                        text = "Tap 'Select This Folder' below to sync here, or 'New Folder' to create a subfolder.",
                                         style = MaterialTheme.typography.bodySmall,
                                         color = MaterialTheme.colorScheme.onSurfaceVariant
                                     )
                                 }
-                                if (isSelected) {
+                            }
+                        }
+                    } else {
+                        items(directChildFolders, key = { it.folderKey }) { option ->
+                            val subCount = childCountByFolderKey[option.folderKey] ?: 0
+                            Surface(
+                                shape = RoundedCornerShape(10.dp),
+                                border = BorderStroke(1.dp, MaterialTheme.colorScheme.outlineVariant),
+                                color = MaterialTheme.colorScheme.surface,
+                                modifier = Modifier
+                                    .fillMaxWidth()
+                                    .clickable {
+                                        // Navigate INSIDE this folder to show its subfolders!
+                                        currentFolder = option
+                                    }
+                            ) {
+                                Row(
+                                    verticalAlignment = Alignment.CenterVertically,
+                                    modifier = Modifier
+                                        .fillMaxWidth()
+                                        .padding(horizontal = 14.dp, vertical = 11.dp)
+                                ) {
                                     Icon(
-                                        imageVector = Icons.Default.Check,
-                                        contentDescription = "Selected",
+                                        imageVector = Icons.Default.Folder,
+                                        contentDescription = null,
                                         tint = MaterialTheme.colorScheme.primary
                                     )
+                                    Spacer(modifier = Modifier.width(12.dp))
+                                    Column(modifier = Modifier.weight(1f)) {
+                                        Text(
+                                            text = option.displayName,
+                                            style = MaterialTheme.typography.bodyLarge,
+                                            fontWeight = FontWeight.Medium,
+                                            maxLines = 1,
+                                            overflow = TextOverflow.Ellipsis
+                                        )
+                                        Text(
+                                            text = if (subCount > 0) {
+                                                "$subCount subfolder${if (subCount > 1) "s" else ""} • Tap to open"
+                                            } else {
+                                                "Tap to open folder"
+                                            },
+                                            style = MaterialTheme.typography.bodySmall,
+                                            color = MaterialTheme.colorScheme.onSurfaceVariant,
+                                            maxLines = 1,
+                                            overflow = TextOverflow.Ellipsis
+                                        )
+                                    }
+                                    TextButton(
+                                        onClick = { onSelect(option) },
+                                        contentPadding = PaddingValues(horizontal = 8.dp, vertical = 2.dp)
+                                    ) {
+                                        Text("Select", style = MaterialTheme.typography.labelMedium)
+                                    }
                                 }
                             }
                         }

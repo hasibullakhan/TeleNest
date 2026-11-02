@@ -45,17 +45,19 @@ class TransferService : Service() {
             ACTION_CANCEL_TRANSFER -> {
                 val uniqueId = intent.getStringExtra(EXTRA_UNIQUE_ID)
                 if (uniqueId != null) {
-                    transferRepository.cancelTransfer(uniqueId)
+                    if (uniqueId.startsWith("sync_")) {
+                        transferRepository.cancelAllTransfers(notifyExternal = true)
+                        stopForeground(STOP_FOREGROUND_REMOVE)
+                        stopSelf()
+                    } else {
+                        transferRepository.cancelTransfer(uniqueId)
+                    }
                 }
             }
             ACTION_CANCEL_ALL -> {
-                transferRepository.transfers.value.values
-                    .filter {
-                        it.status == TransferRepository.Status.DOWNLOADING ||
-                            it.status == TransferRepository.Status.UPLOADING ||
-                            it.status == TransferRepository.Status.QUEUED
-                    }
-                    .forEach { transferRepository.cancelTransfer(it.remoteUniqueId) }
+                transferRepository.cancelAllTransfers(notifyExternal = true)
+                stopForeground(STOP_FOREGROUND_REMOVE)
+                stopSelf()
             }
         }
         return super.onStartCommand(intent, flags, startId)

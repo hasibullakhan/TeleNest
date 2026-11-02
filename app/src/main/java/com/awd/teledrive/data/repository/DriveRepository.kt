@@ -86,14 +86,55 @@ class DriveRepository @Inject constructor(
 
     private val pendingMessageSends = java.util.concurrent.ConcurrentHashMap<Long, kotlinx.coroutines.CompletableDeferred<TdApi.Message?>>()
     private val completedMessageSends = java.util.concurrent.ConcurrentHashMap<Long, TdApi.Message>()
+    private val failedMessageSends = java.util.concurrent.ConcurrentHashMap<Long, Boolean>()
     private val pendingSendMetaMap = java.util.concurrent.ConcurrentHashMap<Long, PendingSendMeta>()
     private val recentlyCreatedMessageIds = java.util.concurrent.ConcurrentHashMap<Long, Long>()
     private val pendingOfflineDownloads = java.util.concurrent.ConcurrentHashMap<String, Pair<Long, Long>>() // remoteUniqueId -> (messageId, chatId)
     private val completedFilePathCache = java.util.concurrent.ConcurrentHashMap<String, String>()
+    private val pendingPathUpdates = java.util.concurrent.ConcurrentHashMap<String, String>()
+    private val pathFlushMutex = kotlinx.coroutines.sync.Mutex()
+    @Volatile
+    private var pathFlushJob: kotlinx.coroutines.Job? = null
+    private val folderColorCache = java.util.concurrent.ConcurrentHashMap<String, String>()
+    private val offlineFileExistsCache = java.util.concurrent.ConcurrentHashMap<String, Pair<Long, Boolean>>()
+    private val lastChatFetchTimeMs = java.util.concurrent.ConcurrentHashMap<Long, Long>()
+    @Volatile
+    private var lastFullSyncTimeMs: Long = 0L
+    @Volatile
+    private var virtualFolderSyncJob: kotlinx.coroutines.Job? = null
+    private val liveFileUploadBytes = java.util.concurrent.ConcurrentHashMap<Int, Pair<Long, Long>>() // fileId -> (uploaded, total)
+    private val liveFileDownloadBytes = java.util.concurrent.ConcurrentHashMap<Int, Pair<Long, Long>>() // fileId -> (downloaded, total)
+    private val activeSyncUploads = java.util.concurrent.ConcurrentHashMap<String, Triple<Long, Long, Int>>() // syncKey -> (chatId, tempMsgId, tdFileId)
+    private val activeSyncDownloadFileIds = java.util.concurrent.ConcurrentHashMap.newKeySet<Int>()
 
     companion object {
         const val TRASH_RETENTION_MS = 30L * 24 * 60 * 60 * 1000L // 30 Days
         const val RECENT_WINDOW_MS = 7L * 24 * 60 * 60 * 1000L   // 7 Days
+    }
+
+    private fun schedulePathUpdatesFlush() {
+        if (pathFlushJob?.isActive == true) return
+        pathFlushJob = scope.launch {
+            kotlinx.coroutines.delay(180L)
+            flushPendingPathUpdatesNow()
+        }
+    }
+
+    private suspend fun flushPendingPathUpdatesNow() {
+        if (pendingPathUpdates.isEmpty()) return
+        pathFlushMutex.lock()
+        try {
+            if (pendingPathUpdates.isEmpty()) return
+            val snapshot = HashMap(pendingPathUpdates)
+            snapshot.keys.forEach { key -> pendingPathUpdates.remove(key, snapshot[key]) }
+            if (snapshot.isNotEmpty()) {
+                driveDao.updateFileAndThumbnailPathsBatch(snapshot)
+            }
+        } catch (e: Exception) {
+            Log.w("DriveRepo", "Batch path update error: ${e.message}")
+        } finally {
+            pathFlushMutex.unlock()
+        }
     }
 
     init {
@@ -118,10 +159,18 @@ class DriveRepository @Inject constructor(
                 val file = update.file
                 val uniqueId = file.remote.uniqueId
                 val path = file.local.path
+                val totalExpected = maxOf(file.expectedSize, file.size)
+                if (file.remote.isUploadingActive || file.remote.isUploadingCompleted || file.remote.uploadedSize > 0L) {
+                    liveFileUploadBytes[file.id] = file.remote.uploadedSize to totalExpected
+                }
+                if (file.local.isDownloadingActive || file.local.isDownloadingCompleted || file.local.downloadedSize > 0L) {
+                    liveFileDownloadBytes[file.id] = file.local.downloadedSize to totalExpected
+                }
                 if (file.local.isDownloadingCompleted && uniqueId.isNotEmpty() && path.isNotEmpty()) {
                     if (completedFilePathCache[uniqueId] != path) {
                         completedFilePathCache[uniqueId] = path
-                        driveDao.updateFileAndThumbnailPathIfChanged(uniqueId, path)
+                        pendingPathUpdates[uniqueId] = path
+                        schedulePathUpdatesFlush()
                     }
                     val pendingOffline = pendingOfflineDownloads.remove(uniqueId)
                     if (pendingOffline != null) {
@@ -203,6 +252,7 @@ class DriveRepository @Inject constructor(
                         pendingMessageSends.remove(oldId)?.complete(msg)
                     }
                     is TdApi.UpdateMessageSendFailed -> {
+                        failedMessageSends[update.oldMessageId] = true
                         pendingSendMetaMap.remove(update.oldMessageId)
                         pendingMessageSends.remove(update.oldMessageId)?.complete(null)
                     }
@@ -223,6 +273,12 @@ class DriveRepository @Inject constructor(
             currentManifest = TeleDriveManifest()
             manifestMessageId = 0L
             completedFilePathCache.clear()
+            pendingPathUpdates.clear()
+            folderColorCache.clear()
+            offlineFileExistsCache.clear()
+            lastChatFetchTimeMs.clear()
+            lastFullSyncTimeMs = 0L
+            preloadedChannelIds.clear()
             pendingOfflineDownloads.clear()
             pendingSendMetaMap.clear()
             recentlyCreatedMessageIds.clear()
@@ -236,7 +292,7 @@ class DriveRepository @Inject constructor(
             purgeExpiredTrashItems()
             telegramClient.send(TdApi.GetAuthorizationState()) { state ->
                 if (state is TdApi.AuthorizationStateReady) {
-                    fetchFiles(0L)
+                    fetchFiles(0L, forceRefresh = true)
                 }
             }
         }
@@ -397,19 +453,25 @@ class DriveRepository @Inject constructor(
 
     private fun getResolvedFolderColor(isVirtual: Boolean, virtualId: String?, telegramChatId: Long): String? {
         val key = if (isVirtual) (virtualId ?: telegramChatId.toString()) else telegramChatId.toString()
+        folderColorCache[key]?.let { cached ->
+            return cached.takeIf { it.isNotEmpty() }
+        }
         val localPref = manifestPrefs.getString("folder_color_$key", null)
-        if (localPref != null) {
-            return localPref.takeIf { it.isNotBlank() }
+        val resolved = if (localPref != null) {
+            localPref.takeIf { it.isNotBlank() }
+        } else if (isVirtual && virtualId != null) {
+            currentManifest.virtualFolders[virtualId]?.colorHex?.takeIf { it.isNotBlank() }
+        } else {
+            null
         }
-        if (isVirtual && virtualId != null) {
-            return currentManifest.virtualFolders[virtualId]?.colorHex?.takeIf { it.isNotBlank() }
-        }
-        return null
+        folderColorCache[key] = resolved ?: ""
+        return resolved
     }
 
     fun setFolderColor(folder: DriveItem.Folder, colorHex: String?) {
         val cleanColor = colorHex?.trim()?.takeIf { it.isNotEmpty() }
         val key = if (folder.isVirtual) (folder.virtualId ?: folder.id.toString()) else folder.telegramChatId.toString()
+        folderColorCache[key] = cleanColor ?: ""
         manifestPrefs.edit()
             .putString("folder_color_$key", cleanColor ?: "")
             .apply()
@@ -1028,8 +1090,23 @@ class DriveRepository @Inject constructor(
         }
     }
 
-    private fun syncVirtualFoldersToDb() {
-        scope.launch {
+    private fun syncVirtualFoldersToDb(immediate: Boolean = false) {
+        if (immediate) {
+            virtualFolderSyncJob?.cancel()
+            virtualFolderSyncJob = scope.launch {
+                if (savedMessagesChatId != 0L) {
+                    driveDao.cleanupZeroChatPhysicalFolders(savedMessagesChatId)
+                    driveDao.cleanupAllZeroChatItems(savedMessagesChatId)
+                }
+                val entities = buildVirtualFolderEntities()
+                driveDao.syncVirtualFolders(entities)
+                reconcileTrashStatesInDb()
+            }
+            return
+        }
+        virtualFolderSyncJob?.cancel()
+        virtualFolderSyncJob = scope.launch {
+            kotlinx.coroutines.delay(120L)
             if (savedMessagesChatId != 0L) {
                 driveDao.cleanupZeroChatPhysicalFolders(savedMessagesChatId)
                 driveDao.cleanupAllZeroChatItems(savedMessagesChatId)
@@ -1048,7 +1125,7 @@ class DriveRepository @Inject constructor(
         updatedFolders[id] = folder
         currentManifest = currentManifest.copy(virtualFolders = updatedFolders, updatedAt = nowSec)
         saveLocalManifest()
-        syncVirtualFoldersToDb()
+        syncVirtualFoldersToDb(immediate = true)
         
         // Send distributed metadata message and track its ID
         if (savedMessagesChatId != 0L) {
@@ -1257,7 +1334,7 @@ class DriveRepository @Inject constructor(
             )
         } else {
             val validOfflinePath = if (entity.isOffline && !entity.offlinePath.isNullOrEmpty()) {
-                entity.offlinePath.takeIf { File(it).exists() }
+                entity.offlinePath.takeIf { isOfflineFilePresentCached(it) }
             } else null
             DriveItem.File(
                 id = entity.id,
@@ -1329,6 +1406,22 @@ class DriveRepository @Inject constructor(
         return result.sortedWith(compareByDescending<DriveItemEntity> { it.isVirtual }.thenBy { it.name.lowercase() })
     }
 
+    private fun isOfflineFilePresentCached(path: String): Boolean {
+        val now = System.currentTimeMillis()
+        val cached = offlineFileExistsCache[path]
+        if (cached != null && now - cached.first < 15_000L) {
+            return cached.second
+        }
+        val exists = try {
+            File(path).exists()
+        } catch (_: Exception) {
+            false
+        }
+        offlineFileExistsCache[path] = now to exists
+        return exists
+    }
+
+    @OptIn(FlowPreview::class)
     fun getAllAvailableFolders(): Flow<List<DriveItem.Folder>> {
         return combine(
             driveDao.getAllFoldersIncludingTrashedFlow(),
@@ -1347,9 +1440,10 @@ class DriveRepository @Inject constructor(
             uniqueFolders.mapNotNull { entity ->
                 mapEntityToDriveItem(entity, uniqueFiles, uniqueFolders, statsIndex) as? DriveItem.Folder
             }
-        }.distinctUntilChanged().flowOn(Dispatchers.Default)
+        }.debounce(40).distinctUntilChanged().flowOn(Dispatchers.Default)
     }
 
+    @OptIn(FlowPreview::class)
     fun getAllFiles(): Flow<List<DriveItem.File>> {
         return combine(
             driveDao.getAllFiles(),
@@ -1364,7 +1458,7 @@ class DriveRepository @Inject constructor(
                 .distinctBy { "${it.parentChatId}_${it.id}" }
                 .map { entity ->
                     val validOfflinePath = if (entity.isOffline && !entity.offlinePath.isNullOrEmpty()) {
-                        entity.offlinePath.takeIf { File(it).exists() }
+                        entity.offlinePath.takeIf { isOfflineFilePresentCached(it) }
                     } else null
                     DriveItem.File(
                         entity.id,
@@ -1388,7 +1482,7 @@ class DriveRepository @Inject constructor(
                         validOfflinePath
                     )
                 }
-        }.distinctUntilChanged().flowOn(Dispatchers.Default)
+        }.debounce(40).distinctUntilChanged().flowOn(Dispatchers.Default)
     }
 
     fun getStarredItems(): Flow<List<DriveItem>> {
@@ -1537,7 +1631,7 @@ class DriveRepository @Inject constructor(
         }.debounce(35).distinctUntilChanged().flowOn(Dispatchers.Default)
     }
 
-    fun fetchFiles(chatId: Long? = null) {
+    fun fetchFiles(chatId: Long? = null, forceRefresh: Boolean = false) {
         scope.launch { cleanupRecoveredFoldersInDb() }
         val targetChatId = chatId ?: savedMessagesChatId
         if (targetChatId == 0L) {
@@ -1546,11 +1640,27 @@ class DriveRepository @Inject constructor(
                     savedMessagesChatId = result.id
                     _savedMessagesChatIdFlow.value = result.id
                     manifestPrefs.edit().putLong("saved_messages_chat_id", result.id).apply()
+                    val now = System.currentTimeMillis()
+                    lastFullSyncTimeMs = now
+                    lastChatFetchTimeMs[savedMessagesChatId] = now
                     fetchCloudManifest { syncFolders { loadAllDriveItems(savedMessagesChatId) } }
                 }
             }
         } else {
-            fetchCloudManifest { syncFolders { loadAllDriveItems(targetChatId) } }
+            val now = System.currentTimeMillis()
+            val lastChatFetch = lastChatFetchTimeMs[targetChatId] ?: 0L
+            val lastFullSync = lastFullSyncTimeMs
+            if (!forceRefresh && now - lastChatFetch < 45_000L && now - lastFullSync < 60_000L) {
+                // Already synced recently; local Room cache serves the folder instantaneously without redundant network/chat scans
+                return
+            }
+            lastChatFetchTimeMs[targetChatId] = now
+            if (forceRefresh || now - lastFullSync >= 60_000L) {
+                lastFullSyncTimeMs = now
+                fetchCloudManifest { syncFolders { loadAllDriveItems(targetChatId) } }
+            } else {
+                loadAllDriveItems(targetChatId)
+            }
         }
     }
 
@@ -1591,7 +1701,8 @@ class DriveRepository @Inject constructor(
     private fun fetchHistoryRecursively(chatId: Long, fromMessageId: Long, allFetchedIds: MutableList<Long>) {
         telegramClient.send(TdApi.GetChatHistory(chatId, fromMessageId, 0, 100, false)) { result ->
             if (result is TdApi.Messages) {
-                if (result.messages.isEmpty()) {
+                val batchMessages = result.messages
+                if (batchMessages.isEmpty()) {
                     scope.launch {
                         if (allFetchedIds.isNotEmpty()) {
                             val now = System.currentTimeMillis()
@@ -1604,27 +1715,24 @@ class DriveRepository @Inject constructor(
                     return@send
                 }
 
-                result.messages.forEach { message ->
-                    if (message.sendingState != null) {
-                        allFetchedIds.add(message.id)
+                scope.launch(Dispatchers.Default) {
+                    batchMessages.forEach { message ->
+                        if (message.sendingState != null) {
+                            allFetchedIds.add(message.id)
+                        }
                     }
-                }
 
-                val entities = result.messages.mapNotNull { message ->
-                    if (message.sendingState != null) return@mapNotNull null
-                    mapMessageToEntity(chatId, message)
-                }
-                
-                allFetchedIds.addAll(entities.map { it.id })
+                    val entities = batchMessages.mapNotNull { message ->
+                        if (message.sendingState != null) return@mapNotNull null
+                        mapMessageToEntity(chatId, message)
+                    }
 
-                scope.launch {
+                    allFetchedIds.addAll(entities.map { it.id })
                     driveDao.insertItemsPreservingStarred(entities)
-                }
 
-                if (allFetchedIds.size < 15000) {
-                    fetchHistoryRecursively(chatId, result.messages.last().id, allFetchedIds)
-                } else {
-                    scope.launch {
+                    if (allFetchedIds.size < 15000) {
+                        fetchHistoryRecursively(chatId, batchMessages.last().id, allFetchedIds)
+                    } else {
                         val now = System.currentTimeMillis()
                         recentlyCreatedMessageIds.entries.removeIf { now - it.value > 600_000L }
                         val keepIds = (allFetchedIds + recentlyCreatedMessageIds.keys + pendingSendMetaMap.keys).distinct()
@@ -3884,7 +3992,9 @@ class DriveRepository @Inject constructor(
         val fullPath: String,
         val chatId: Long,
         val virtualFolderId: String,
-        val parentVirtualId: String
+        val parentVirtualId: String,
+        val folderKey: String = if (fullPath == "/") "ROOT" else if (virtualFolderId != "0" && virtualFolderId.isNotBlank()) virtualFolderId else "ch_$chatId",
+        val parentFolderKey: String = if (fullPath == "/") "" else if (parentVirtualId.isNotBlank() && parentVirtualId != "0") parentVirtualId else "ROOT"
     )
 
     suspend fun ensureReadyChatIdSuspend(): Long {
@@ -3911,12 +4021,17 @@ class DriveRepository @Inject constructor(
                 fullPath = "/",
                 chatId = rootChat,
                 virtualFolderId = "0",
-                parentVirtualId = ""
+                parentVirtualId = "",
+                folderKey = "ROOT",
+                parentFolderKey = ""
             )
         )
 
         val allItems = driveDao.getAllItemsSync().filter { !it.isTrashed }
-        val channelFolders = allItems.filter { it.isFolder && !it.isVirtual && it.id != rootChat && it.id != 0L }
+        val channelFolders = allItems.filter {
+            it.isFolder && !it.isVirtual && it.id != rootChat && it.id != 0L &&
+                !currentManifest.trashedFolderIds.containsKey(it.id.toString())
+        }
         val virtualFoldersMap = synchronized(currentManifest) {
             currentManifest.virtualFolders.filterKeys { vid ->
                 !currentManifest.deletedFolderIds.containsKey(vid) &&
@@ -3924,60 +4039,171 @@ class DriveRepository @Inject constructor(
             }
         }
 
-        channelFolders.sortedBy { it.name.lowercase() }.forEach { ch ->
-            result.add(
-                RemoteFolderOption(
-                    displayName = ch.name,
-                    fullPath = "/${ch.name}",
-                    chatId = ch.id,
-                    virtualFolderId = "0",
-                    parentVirtualId = "0"
-                )
-            )
-        }
+        // Track canonical folder key per (parentFolderKey, normalizedName) so duplicate folders are merged cleanly
+        val canonicalKeyByParentAndName = LinkedHashMap<Pair<String, String>, RemoteFolderOption>()
+        val duplicateKeyRemap = HashMap<String, String>()
 
-        fun buildVfPath(vf: VirtualFolder, visited: Set<String> = emptySet()): Pair<String, Long> {
-            if (vf.id in visited) return "/${vf.name}" to rootChat
-            val pid = vf.parentId
+        channelFolders
+            .sortedBy { it.name.trim().lowercase() }
+            .forEach { ch ->
+                val cleanName = ch.name.trim().trim('/').ifBlank { "Folder_${ch.id}" }
+                val rawKey = "ch_${ch.id}"
+                val dedupKey = "ROOT" to cleanName.lowercase()
+                val existing = canonicalKeyByParentAndName[dedupKey]
+                if (existing == null) {
+                    val opt = RemoteFolderOption(
+                        displayName = cleanName,
+                        fullPath = "/$cleanName",
+                        chatId = ch.id,
+                        virtualFolderId = "0",
+                        parentVirtualId = "0",
+                        folderKey = rawKey,
+                        parentFolderKey = "ROOT"
+                    )
+                    canonicalKeyByParentAndName[dedupKey] = opt
+                    result.add(opt)
+                } else {
+                    duplicateKeyRemap[rawKey] = existing.folderKey
+                    duplicateKeyRemap[ch.id.toString()] = existing.folderKey
+                }
+            }
+
+        fun resolveParentKey(rawPid: String): String {
+            val pid = rawPid.trim()
+            val mappedPid = duplicateKeyRemap[pid] ?: pid
             return when {
-                pid.isBlank() || pid == "0" -> "/${vf.name}" to rootChat
-                pid.startsWith("vf_") -> {
-                    val parentVf = virtualFoldersMap[pid]
-                    if (parentVf != null) {
-                        val (pPath, pChat) = buildVfPath(parentVf, visited + vf.id)
-                        "$pPath/${vf.name}" to pChat
+                mappedPid.isBlank() || mappedPid == "0" || mappedPid == rootChat.toString() -> "ROOT"
+                mappedPid.startsWith("ch_") -> mappedPid
+                mappedPid.startsWith("vf_") -> {
+                    if (virtualFoldersMap.containsKey(mappedPid) || duplicateKeyRemap.containsKey(pid)) {
+                        duplicateKeyRemap[pid] ?: mappedPid
                     } else {
-                        "/${vf.name}" to rootChat
+                        "ROOT"
                     }
                 }
                 else -> {
-                    val chId = pid.toLongOrNull() ?: rootChat
-                    val chName = channelFolders.firstOrNull { it.id == chId }?.name
-                    if (chName != null) {
-                        "/$chName/${vf.name}" to chId
+                    val chId = mappedPid.toLongOrNull()
+                    if (chId != null && channelFolders.any { it.id == chId }) {
+                        duplicateKeyRemap["ch_$chId"] ?: "ch_$chId"
                     } else {
-                        "/${vf.name}" to chId
+                        "ROOT"
                     }
                 }
             }
         }
 
-        virtualFoldersMap.values
-            .filter { !it.name.startsWith("Recovered_") }
-            .map { vf ->
-                val (fullPath, resolvedChatId) = buildVfPath(vf)
-                RemoteFolderOption(
-                    displayName = vf.name,
+        // Process virtual folders in topological order (parents before children)
+        val validVfs = virtualFoldersMap.values
+            .filter { !it.name.startsWith("Recovered_") && isVirtualFolderOrAncestorTrashed(it.id) == null }
+
+        fun getDepth(vf: VirtualFolder, visited: Set<String> = emptySet()): Int {
+            if (vf.id in visited) return 0
+            val pid = vf.parentId.trim()
+            val parentVf = if (pid.startsWith("vf_")) virtualFoldersMap[pid] else null
+            return if (parentVf != null) 1 + getDepth(parentVf, visited + vf.id) else 0
+        }
+
+        val sortedVfs = validVfs.sortedWith(
+            compareBy<VirtualFolder> { getDepth(it) }
+                .thenBy { it.name.trim().lowercase() }
+                .thenBy { it.createdAt }
+        )
+
+        val optionByFolderKey = HashMap<String, RemoteFolderOption>()
+        result.forEach { optionByFolderKey[it.folderKey] = it }
+
+        for (vf in sortedVfs) {
+            val cleanName = vf.name.trim().trim('/').ifBlank { continue }
+            val parentKey = resolveParentKey(vf.parentId)
+            val parentOpt = optionByFolderKey[parentKey] ?: result.first()
+            val effectiveParentKey = parentOpt.folderKey
+            val resolvedChatId = if (parentOpt.folderKey == "ROOT") rootChat else parentOpt.chatId
+
+            val dedupKey = effectiveParentKey to cleanName.lowercase()
+            val existing = canonicalKeyByParentAndName[dedupKey]
+            if (existing != null) {
+                // Prefer virtualFolderId if existing was a channel or older duplicate, and remap children to existing
+                duplicateKeyRemap[vf.id] = existing.folderKey
+            } else {
+                val fullPath = if (parentOpt.fullPath == "/") {
+                    "/$cleanName"
+                } else {
+                    "${parentOpt.fullPath.trimEnd('/')}/$cleanName"
+                }
+                val opt = RemoteFolderOption(
+                    displayName = cleanName,
                     fullPath = fullPath,
                     chatId = resolvedChatId,
                     virtualFolderId = vf.id,
-                    parentVirtualId = vf.parentId.ifBlank { "0" }
+                    parentVirtualId = if (effectiveParentKey == "ROOT") "0" else effectiveParentKey,
+                    folderKey = vf.id,
+                    parentFolderKey = effectiveParentKey
                 )
+                canonicalKeyByParentAndName[dedupKey] = opt
+                optionByFolderKey[opt.folderKey] = opt
+                result.add(opt)
             }
-            .sortedBy { it.fullPath.lowercase() }
-            .forEach { result.add(it) }
+        }
 
         return result
+    }
+
+    suspend fun resolveSyncTargetFolderSuspend(
+        remotePathDisplay: String,
+        preferredChatId: Long,
+        preferredVfId: String
+    ): Pair<Long, String> {
+        val rootChat = ensureReadyChatIdSuspend()
+        if (rootChat == 0L) return 0L to "0"
+
+        val cleanPath = remotePathDisplay
+            .trim()
+            .replace('\\', '/')
+            .split('/')
+            .map { it.trim() }
+            .filter { it.isNotEmpty() }
+            .joinToString("/")
+
+        if (cleanPath.isEmpty() ||
+            cleanPath.equals("(Root - My Drive)", ignoreCase = true) ||
+            cleanPath.equals("My Drive", ignoreCase = true)
+        ) {
+            return rootChat to "0"
+        }
+
+        // Check if existing selectable folders already have an exact path match
+        val allSelectable = getAllSelectableRemoteFoldersSuspend()
+        val normalizedTargetPath = "/$cleanPath"
+        val exactMatch = allSelectable.firstOrNull {
+            it.fullPath.equals(normalizedTargetPath, ignoreCase = true)
+        }
+        if (exactMatch != null) {
+            val chat = if (exactMatch.chatId == 0L) rootChat else exactMatch.chatId
+            return chat to exactMatch.virtualFolderId.ifBlank { "0" }
+        }
+
+        // Check if first segment is a physical channel folder
+        val segments = cleanPath.split('/').map { it.trim() }.filter { it.isNotEmpty() }
+        val firstSegment = segments.first()
+        val topChannel = allSelectable.firstOrNull {
+            it.parentFolderKey == "ROOT" &&
+                it.virtualFolderId == "0" &&
+                it.chatId != rootChat &&
+                it.displayName.equals(firstSegment, ignoreCase = true)
+        }
+
+        return if (topChannel != null) {
+            if (segments.size == 1) {
+                topChannel.chatId to "0"
+            } else {
+                val subRelPath = segments.drop(1).joinToString("/")
+                val vfId = ensureVirtualFolderPathSuspend(topChannel.chatId, "0", subRelPath)
+                topChannel.chatId to vfId
+            }
+        } else {
+            val vfId = ensureVirtualFolderPathSuspend(rootChat, "0", cleanPath)
+            rootChat to vfId
+        }
     }
 
     suspend fun ensureVirtualFolderPathSuspend(
@@ -4002,8 +4228,8 @@ class DriveRepository @Inject constructor(
                     !vf.name.startsWith("Recovered_") &&
                         !currentManifest.deletedFolderIds.containsKey(vf.id) &&
                         !currentManifest.trashedFolderIds.containsKey(vf.id) &&
-                        vf.parentId == currentParentId &&
-                        vf.name.equals(segment, ignoreCase = true)
+                        vf.parentId.trim() == currentParentId &&
+                        vf.name.trim().equals(segment, ignoreCase = true)
                 }
             }
             if (existingVf != null) {
@@ -4064,7 +4290,14 @@ class DriveRepository @Inject constructor(
     ): List<Pair<String, DriveItemEntity>> {
         val rootChat = ensureReadyChatIdSuspend()
         val effectiveChatId = if (baseChatId == 0L) rootChat else baseChatId
-        val allItems = driveDao.getAllItemsSync().filter { !it.isTrashed }
+        val trashedFileKeys = synchronized(currentManifest) {
+            currentManifest.trashedFileIds.keys.toSet()
+        }
+        val allItems = driveDao.getAllItemsSync().filter { item ->
+            !item.isTrashed &&
+                !trashedFileKeys.contains("${item.parentChatId}_${item.id}") &&
+                !trashedFileKeys.contains(item.id.toString())
+        }
         val activeVfMap = synchronized(currentManifest) {
             currentManifest.virtualFolders.filterKeys { vid ->
                 !currentManifest.deletedFolderIds.containsKey(vid) &&
@@ -4074,11 +4307,27 @@ class DriveRepository @Inject constructor(
 
         val result = mutableListOf<Pair<String, DriveItemEntity>>()
 
+        // Also include equivalent duplicate virtual folders sharing the same parent and trimmed name
+        fun findEquivalentVfIds(vfId: String): Set<String> {
+            if (vfId == "0" || !vfId.startsWith("vf_")) return setOf(vfId)
+            val targetVf = activeVfMap[vfId] ?: return setOf(vfId)
+            val targetName = targetVf.name.trim()
+            val targetParent = targetVf.parentId.trim()
+            return activeVfMap.values
+                .filter {
+                    it.parentId.trim() == targetParent &&
+                        it.name.trim().equals(targetName, ignoreCase = true)
+                }
+                .map { it.id }
+                .toSet() + vfId
+        }
+
         fun collectAt(chatId: Long, vfId: String, relPrefix: String, visited: Set<String>) {
+            val equivalentVfIds = findEquivalentVfIds(vfId)
             val filesHere = allItems.filter { item ->
                 !item.isFolder && (
                     if (vfId != "0" && vfId.startsWith("vf_")) {
-                        item.virtualParentId == vfId
+                        item.virtualParentId in equivalentVfIds
                     } else {
                         item.parentChatId == chatId &&
                             (item.virtualParentId.isNullOrEmpty() || item.virtualParentId == "0" || item.virtualParentId == chatId.toString())
@@ -4086,22 +4335,33 @@ class DriveRepository @Inject constructor(
                 )
             }
             filesHere.forEach { fileEntity ->
-                val relPath = if (relPrefix.isEmpty()) fileEntity.name else "$relPrefix/${fileEntity.name}"
-                result.add(relPath to fileEntity)
+                val cleanFileName = fileEntity.name.trim()
+                if (cleanFileName.isNotEmpty()) {
+                    val relPath = if (relPrefix.isEmpty()) cleanFileName else "$relPrefix/$cleanFileName"
+                    result.add(relPath to fileEntity)
+                }
             }
 
             if (includeSubfolders) {
-                val expectedParentKey = when {
-                    vfId != "0" && vfId.startsWith("vf_") -> vfId
-                    chatId != rootChat && chatId != 0L -> chatId.toString()
-                    else -> "0"
+                val expectedParentKeys = when {
+                    vfId != "0" && vfId.startsWith("vf_") -> equivalentVfIds
+                    chatId != rootChat && chatId != 0L -> setOf(chatId.toString())
+                    else -> setOf("0", "")
                 }
                 val childVfs = activeVfMap.values.filter { vf ->
-                    vf.parentId == expectedParentKey && vf.id !in visited && !vf.name.startsWith("Recovered_")
+                    vf.parentId.trim() in expectedParentKeys &&
+                        vf.id !in visited &&
+                        !vf.name.startsWith("Recovered_")
                 }
-                childVfs.forEach { childVf ->
-                    val nextPrefix = if (relPrefix.isEmpty()) childVf.name else "$relPrefix/${childVf.name}"
-                    collectAt(chatId, childVf.id, nextPrefix, visited + childVf.id)
+                // Group child VFs by trimmed lowercase name so duplicate subfolders are traversed cleanly together
+                childVfs.groupBy { it.name.trim().lowercase() }.values.forEach { sameNameGroup ->
+                    val primaryChild = sameNameGroup.first()
+                    val cleanSubName = primaryChild.name.trim().trim('/')
+                    if (cleanSubName.isNotEmpty()) {
+                        val nextPrefix = if (relPrefix.isEmpty()) cleanSubName else "$relPrefix/$cleanSubName"
+                        val groupIds = sameNameGroup.map { it.id }.toSet()
+                        collectAt(chatId, primaryChild.id, nextPrefix, visited + groupIds)
+                    }
                 }
             }
         }
@@ -4110,11 +4370,50 @@ class DriveRepository @Inject constructor(
         return result
     }
 
+    fun cancelAllSyncTransfers() {
+        // 1. Immediately abort all active TDLib sync uploads & delete unsent temporary messages
+        val uploadsSnapshot = activeSyncUploads.entries.toList()
+        activeSyncUploads.clear()
+        uploadsSnapshot.forEach { (syncKey, info) ->
+            val (chatId, tempMsgId, tdFileId) = info
+            if (tempMsgId != 0L && chatId != 0L) {
+                pendingSendMetaMap.remove(tempMsgId)
+                pendingMessageSends.remove(tempMsgId)?.complete(null)
+                completedMessageSends.remove(tempMsgId)
+                telegramClient.send(TdApi.DeleteMessages(chatId, longArrayOf(tempMsgId), true)) {}
+                scope.launch {
+                    try {
+                        driveDao.deleteItemCompletely(tempMsgId, chatId)
+                    } catch (_: Exception) {}
+                }
+            }
+            if (tdFileId != 0) {
+                telegramClient.send(TdApi.CancelPreliminaryUploadFile(tdFileId)) {}
+            }
+            transferRepository.removeTransfer(syncKey)
+        }
+
+        // 2. Immediately abort all active TDLib sync downloads
+        val downloadsSnapshot = activeSyncDownloadFileIds.toList()
+        activeSyncDownloadFileIds.clear()
+        downloadsSnapshot.forEach { fileId ->
+            if (fileId != 0) {
+                telegramClient.send(TdApi.CancelDownloadFile(fileId, false)) {}
+            }
+        }
+    }
+
+    fun flushSyncManifest() {
+        saveLocalManifest()
+        saveCloudManifest()
+    }
+
     suspend fun uploadFileForSyncSuspend(
         localFile: File,
         targetChatId: Long,
         targetVirtualFolderId: String,
-        originalTimestampMillis: Long
+        originalTimestampMillis: Long,
+        onProgress: ((Float) -> Unit)? = null
     ): Long? {
         if (!localFile.exists() || !localFile.isFile) return null
         val rootChat = ensureReadyChatIdSuspend()
@@ -4123,9 +4422,10 @@ class DriveRepository @Inject constructor(
 
         val resolvedVfId = targetVirtualFolderId.ifBlank { "0" }
         val origTs = if (originalTimestampMillis > 0L) originalTimestampMillis else FileUtils.extractOriginalTimestampMillis(localFile)
+        val fileLength = localFile.length()
 
-        // For files > 1.95 GB, delegate to standard split upload and wait
-        if (localFile.length() > FileUtils.MAX_FILE_SIZE) {
+        // For files > 1.95 GB, delegate to standard split upload
+        if (fileLength > FileUtils.MAX_FILE_SIZE) {
             uploadFile(
                 filePath = localFile.absolutePath,
                 originalFileName = localFile.name,
@@ -4140,125 +4440,274 @@ class DriveRepository @Inject constructor(
         val tags = listOf(vfTag, otimeTag).filter { it.isNotEmpty() }.joinToString("")
         val captionStr = if (tags.isNotEmpty()) "${localFile.name} $tags" else localFile.name
 
-        val resultDeferred = kotlinx.coroutines.CompletableDeferred<Long?>()
         val isSecure = isChatSecure(resolvedChatId) || (resolvedVfId != "0" && isVirtualFolderSecure(resolvedVfId))
-
-        startTransferService()
         val tempId = "sync_up_${System.nanoTime()}"
 
-        transferRepository.enqueueTransfer(
+        var tempEncFile: File? = null
+        var tempMsgId: Long = 0L
+        var tdFileId: Int = 0
+        var activeUniqueId: String = tempId
+
+        startTransferService()
+        transferRepository.addTransfer(
             fileId = 0,
             remoteUniqueId = tempId,
             fileName = localFile.name,
             isDownload = false,
-            totalSize = localFile.length(),
+            totalSize = fileLength,
+            isCompleted = false,
+            status = TransferRepository.Status.UPLOADING,
             localPath = if (isSecure) null else localFile.absolutePath
-        ) {
-            try {
-                var finalPath = localFile.absolutePath
-                var finalCaption = captionStr
-                var tempEncFile: File? = null
-                if (isSecure) {
-                    val password = secureSessionManager.decryptedPassword.value
-                        ?: masterPasswordService.getStoredPassword()?.also { secureSessionManager.setSessionPassword(it) }
-                        ?: masterPasswordService.getOrCreateDefaultPassword().also { secureSessionManager.setSessionPassword(it) }
-                    val encDir = File(context.cacheDir, "enc_${System.nanoTime()}").apply { mkdirs() }
-                    tempEncFile = File(encDir, localFile.name)
-                    encryptionManager.encryptFile(localFile, tempEncFile, password) { }
-                    finalPath = tempEncFile.absolutePath
-                    finalCaption = "$captionStr [ENC]"
-                }
+        )
 
-                transferRepository.updateTransferBindingSync(tempId, tempId, 0, finalPath)
-                transferRepository.updateTransferManual(tempId, 0f, TransferRepository.Status.UPLOADING)
+        try {
+            kotlinx.coroutines.currentCoroutineContext().let { ctx ->
+                if (!ctx[kotlinx.coroutines.Job]!!.isActive) throw kotlinx.coroutines.CancellationException()
+            }
 
-                val mimeType = FileUtils.getMimeType(localFile.name)
-                val generatedThumbInfo = if (!isSecure && (mimeType.startsWith("image/") || mimeType.startsWith("video/"))) {
-                    generatePreviewThumbnail(localFile.absolutePath, mimeType)
-                } else null
-                val tdInputThumb = generatedThumbInfo?.let { (thumbPath, w, h) ->
-                    TdApi.InputThumbnail(TdApi.InputFileLocal(thumbPath), w, h)
-                }
-                val formattedCaption = TdApi.FormattedText(finalCaption, emptyArray())
-                val inputContent = TdApi.InputMessageDocument(TdApi.InputFileLocal(finalPath), tdInputThumb, true, formattedCaption)
+            var finalPath = localFile.absolutePath
+            var finalCaption = captionStr
+            if (isSecure) {
+                val password = secureSessionManager.decryptedPassword.value
+                    ?: masterPasswordService.getStoredPassword()?.also { secureSessionManager.setSessionPassword(it) }
+                    ?: masterPasswordService.getOrCreateDefaultPassword().also { secureSessionManager.setSessionPassword(it) }
+                val encDir = File(context.cacheDir, "enc_${System.nanoTime()}").apply { mkdirs() }
+                tempEncFile = File(encDir, localFile.name)
+                encryptionManager.encryptFile(localFile, tempEncFile!!, password) { }
+                finalPath = tempEncFile!!.absolutePath
+                finalCaption = "$captionStr [ENC]"
+            }
 
-                val sendRes = sendTdSuspend(TdApi.SendMessage(resolvedChatId, null, null, null, null, inputContent))
-                if (sendRes is TdApi.Message) {
-                    saveLocalFileOriginalTime(sendRes.id, resolvedChatId, origTs)
-                    pendingSendMetaMap[sendRes.id] = PendingSendMeta(
-                        fileName = localFile.name,
-                        virtualFolderId = resolvedVfId,
-                        isEncrypted = isSecure,
-                        thumbnailPath = generatedThumbInfo?.first,
-                        localPath = if (isSecure) null else localFile.absolutePath,
-                        originalTimestamp = origTs
-                    )
-                    val tdFile = (sendRes.content as? TdApi.MessageDocument)?.document?.document
-                    if (tdFile != null) {
-                        val realUniqueId = tdFile.remote.uniqueId.ifEmpty { tempId }
-                        transferRepository.updateRemoteUniqueId(tempId, realUniqueId, tdFile.id, finalPath)
-                    }
+            val mimeType = FileUtils.getMimeType(localFile.name)
+            val generatedThumbInfo = if (!isSecure && (mimeType.startsWith("image/") || mimeType.startsWith("video/"))) {
+                generatePreviewThumbnail(localFile.absolutePath, mimeType)
+            } else null
+            val tdInputThumb = generatedThumbInfo?.let { (thumbPath, w, h) ->
+                TdApi.InputThumbnail(TdApi.InputFileLocal(thumbPath), w, h)
+            }
+            val formattedCaption = TdApi.FormattedText(finalCaption, emptyArray())
+            val inputContent = TdApi.InputMessageDocument(TdApi.InputFileLocal(finalPath), tdInputThumb, true, formattedCaption)
 
-                    val msgDeferred = if (sendRes.sendingState != null) {
-                        completedMessageSends.remove(sendRes.id)?.let { kotlinx.coroutines.CompletableDeferred(it) }
-                            ?: pendingMessageSends.getOrPut(sendRes.id) { kotlinx.coroutines.CompletableDeferred() }
-                    } else {
-                        kotlinx.coroutines.CompletableDeferred(sendRes)
-                    }
+            val sendRes = sendTdSuspend(TdApi.SendMessage(resolvedChatId, null, null, null, null, inputContent))
+            if (sendRes !is TdApi.Message) {
+                transferRepository.removeTransfer(tempId)
+                return null
+            }
 
-                    val finalMsg = msgDeferred.await()
-                    tempEncFile?.let {
-                        try {
-                            it.delete()
-                            it.parentFile?.delete()
-                        } catch (_: Exception) {}
-                    }
+            tempMsgId = sendRes.id
+            val tdFile = (sendRes.content as? TdApi.MessageDocument)?.document?.document
+            tdFileId = tdFile?.id ?: 0
+            activeSyncUploads[tempId] = Triple(resolvedChatId, tempMsgId, tdFileId)
 
-                    if (finalMsg != null) {
-                        saveLocalFileOriginalTime(finalMsg.id, finalMsg.chatId, origTs)
-                        val mapped = mapMessageToEntity(finalMsg.chatId, finalMsg)
-                        if (mapped != null) {
-                            driveDao.insertItemsPreservingStarred(
-                                listOf(
-                                    mapped.copy(
-                                        name = localFile.name,
-                                        size = localFile.length(),
-                                        virtualParentId = resolvedVfId,
-                                        isEncrypted = isSecure,
-                                        createdAt = origTs,
-                                        thumbnailPath = mapped.thumbnailPath ?: generatedThumbInfo?.first
-                                    )
-                                )
-                            )
-                        }
-                        transferRepository.updateTransferManual(tempId, 1.0f, TransferRepository.Status.COMPLETED)
-                        resultDeferred.complete(finalMsg.id)
-                    } else {
-                        transferRepository.updateTransferManual(tempId, 0f, TransferRepository.Status.FAILED)
-                        resultDeferred.complete(null)
-                    }
+            saveLocalFileOriginalTime(tempMsgId, resolvedChatId, origTs)
+            saveLocalFileRename(tempMsgId, resolvedChatId, localFile.name)
+            saveLocalFileVirtualParent(tempMsgId, resolvedChatId, resolvedVfId)
+
+            // Set handledByCaller = true so we don't spam 100+ redundant text messages during batch sync
+            pendingSendMetaMap[tempMsgId] = PendingSendMeta(
+                fileName = localFile.name,
+                virtualFolderId = resolvedVfId,
+                isEncrypted = isSecure,
+                thumbnailPath = generatedThumbInfo?.first,
+                localPath = if (isSecure) null else localFile.absolutePath,
+                handledByCaller = true,
+                originalTimestamp = origTs
+            )
+
+            if (tdFile != null) {
+                val realUniqueId = tdFile.remote.uniqueId.ifEmpty { tempId }
+                activeUniqueId = realUniqueId
+                transferRepository.updateTransferBindingSync(tempId, realUniqueId, tdFile.id, finalPath)
+            }
+
+            // Wait for TDLib to complete message send with live progress & stall protection
+            val msgDeferred: kotlinx.coroutines.CompletableDeferred<TdApi.Message?> =
+                if (sendRes.sendingState != null) {
+                    completedMessageSends.remove(tempMsgId)?.let { kotlinx.coroutines.CompletableDeferred<TdApi.Message?>(it) }
+                        ?: pendingMessageSends.getOrPut(tempMsgId) { kotlinx.coroutines.CompletableDeferred<TdApi.Message?>() }
                 } else {
-                    tempEncFile?.let {
-                        try {
-                            it.delete()
-                            it.parentFile?.delete()
-                        } catch (_: Exception) {}
-                    }
-                    transferRepository.updateTransferManual(tempId, 0f, TransferRepository.Status.FAILED)
-                    resultDeferred.complete(null)
+                    kotlinx.coroutines.CompletableDeferred<TdApi.Message?>(sendRes)
                 }
-            } catch (e: Exception) {
-                transferRepository.updateTransferManual(tempId, 0f, TransferRepository.Status.FAILED)
-                resultDeferred.complete(null)
+
+            var finalMsg: TdApi.Message? = null
+            var lastProgressChangeMs = System.currentTimeMillis()
+            var lastObservedBytes = -1L
+            val startWaitMs = System.currentTimeMillis()
+
+            while (!msgDeferred.isCompleted) {
+                val doneEarly = completedMessageSends.remove(tempMsgId)
+                if (doneEarly != null) {
+                    msgDeferred.complete(doneEarly)
+                    break
+                }
+                if (failedMessageSends.remove(tempMsgId) == true) {
+                    msgDeferred.complete(null)
+                    break
+                }
+
+                // Report live byte progress
+                if (tdFileId != 0) {
+                    val (upBytes, totalBytes) = liveFileUploadBytes[tdFileId] ?: (0L to fileLength)
+                    val denom = if (totalBytes > 0L) totalBytes else fileLength
+                    if (upBytes > lastObservedBytes) {
+                        lastObservedBytes = upBytes
+                        lastProgressChangeMs = System.currentTimeMillis()
+                    }
+                    if (denom > 0L) {
+                        val frac = (upBytes.toFloat() / denom.toFloat()).coerceIn(0f, 0.99f)
+                        onProgress?.invoke(frac)
+                    }
+                }
+
+                val finishedInStep = withTimeoutOrNull(1200L) {
+                    msgDeferred.await()
+                }
+                if (finishedInStep != null || msgDeferred.isCompleted) {
+                    break
+                }
+
+                // Every ~3.6s, verify message state directly from TDLib in case update event was already processed
+                val elapsedMs = System.currentTimeMillis() - startWaitMs
+                if (elapsedMs > 3000L) {
+                    val checkMsg = sendTdSuspend(TdApi.GetMessage(resolvedChatId, tempMsgId))
+                    if (checkMsg is TdApi.Message) {
+                        when (checkMsg.sendingState) {
+                            null -> {
+                                msgDeferred.complete(checkMsg)
+                                break
+                            }
+                            is TdApi.MessageSendingStateFailed -> {
+                                msgDeferred.complete(null)
+                                break
+                            }
+                        }
+                    } else if (checkMsg is TdApi.Error) {
+                        // Message with tempMsgId no longer exists; check if UpdateMessageSendSucceeded already completed
+                        val completed = completedMessageSends.remove(tempMsgId)
+                        if (completed != null) {
+                            msgDeferred.complete(completed)
+                            break
+                        } else if (elapsedMs > 8000L) {
+                            // Check if file already landed in DAO under resolvedVfId
+                            val landed = driveDao.getAllItemsSync().firstOrNull {
+                                !it.isFolder &&
+                                    it.parentChatId == resolvedChatId &&
+                                    it.name == localFile.name &&
+                                    it.size == fileLength
+                            }
+                            if (landed != null) {
+                                activeSyncUploads.remove(tempId)
+                                transferRepository.updateTransferManual(activeUniqueId, 1.0f, TransferRepository.Status.COMPLETED)
+                                onProgress?.invoke(1.0f)
+                                return landed.id
+                            }
+                            msgDeferred.complete(null)
+                            break
+                        }
+                    }
+                }
+
+                // Stall guard: if zero upload progress for over 120 seconds, abort this file so queue never hangs
+                if (System.currentTimeMillis() - lastProgressChangeMs > 120_000L) {
+                    Log.w("DriveRepo", "Upload stalled for >120s on ${localFile.name}, aborting item")
+                    telegramClient.send(TdApi.DeleteMessages(resolvedChatId, longArrayOf(tempMsgId), true)) {}
+                    if (tdFileId != 0) {
+                        telegramClient.send(TdApi.CancelPreliminaryUploadFile(tdFileId)) {}
+                    }
+                    msgDeferred.complete(null)
+                    break
+                }
+            }
+
+            finalMsg = if (msgDeferred.isCompleted) msgDeferred.getCompleted() else null
+            activeSyncUploads.remove(tempId)
+            if (tdFileId != 0) liveFileUploadBytes.remove(tdFileId)
+
+            if (finalMsg != null) {
+                saveLocalFileOriginalTime(finalMsg.id, finalMsg.chatId, origTs)
+                saveLocalFileRename(finalMsg.id, finalMsg.chatId, localFile.name)
+                saveLocalFileVirtualParent(finalMsg.id, finalMsg.chatId, resolvedVfId)
+
+                synchronized(currentManifest) {
+                    val updatedMappings = currentManifest.fileMappings.toMutableMap()
+                    updatedMappings.remove(tempMsgId.toString())
+                    updatedMappings[finalMsg.id.toString()] = resolvedVfId
+                    currentManifest = currentManifest.copy(
+                        fileMappings = updatedMappings,
+                        updatedAt = System.currentTimeMillis() / 1000
+                    )
+                    saveLocalManifest()
+                }
+
+                val mapped = mapMessageToEntity(finalMsg.chatId, finalMsg)
+                if (mapped != null) {
+                    driveDao.insertItemsPreservingStarred(
+                        listOf(
+                            mapped.copy(
+                                name = localFile.name,
+                                size = fileLength,
+                                virtualParentId = resolvedVfId,
+                                isEncrypted = isSecure,
+                                createdAt = origTs,
+                                localPath = if (isSecure) null else localFile.absolutePath,
+                                thumbnailPath = mapped.thumbnailPath ?: generatedThumbInfo?.first
+                            )
+                        )
+                    )
+                }
+                onProgress?.invoke(1.0f)
+                transferRepository.updateTransferManual(activeUniqueId, 1.0f, TransferRepository.Status.COMPLETED)
+                if (activeUniqueId != tempId) {
+                    transferRepository.removeTransfer(tempId)
+                }
+                return finalMsg.id
+            } else {
+                transferRepository.removeTransfer(activeUniqueId)
+                if (activeUniqueId != tempId) transferRepository.removeTransfer(tempId)
+                return null
+            }
+        } catch (ce: kotlinx.coroutines.CancellationException) {
+            // Immediate TDLib abort when user cancels sync!
+            activeSyncUploads.remove(tempId)
+            if (tdFileId != 0) liveFileUploadBytes.remove(tdFileId)
+            if (tempMsgId != 0L) {
+                pendingSendMetaMap.remove(tempMsgId)
+                pendingMessageSends.remove(tempMsgId)?.cancel()
+                completedMessageSends.remove(tempMsgId)
+                telegramClient.send(TdApi.DeleteMessages(resolvedChatId, longArrayOf(tempMsgId), true)) {}
+                scope.launch {
+                    try {
+                        driveDao.deleteItemCompletely(tempMsgId, resolvedChatId)
+                    } catch (_: Exception) {}
+                }
+            }
+            if (tdFileId != 0) {
+                telegramClient.send(TdApi.CancelPreliminaryUploadFile(tdFileId)) {}
+            }
+            transferRepository.removeTransfer(activeUniqueId)
+            if (activeUniqueId != tempId) transferRepository.removeTransfer(tempId)
+            throw ce
+        } catch (e: Exception) {
+            Log.e("DriveRepo", "Sync upload failed for ${localFile.name}: ${e.message}")
+            activeSyncUploads.remove(tempId)
+            if (tdFileId != 0) liveFileUploadBytes.remove(tdFileId)
+            transferRepository.removeTransfer(activeUniqueId)
+            if (activeUniqueId != tempId) transferRepository.removeTransfer(tempId)
+            return null
+        } finally {
+            tempEncFile?.let {
+                try {
+                    it.delete()
+                    it.parentFile?.delete()
+                } catch (_: Exception) {}
             }
         }
-
-        return resultDeferred.await()
     }
 
     suspend fun downloadFileForSyncSuspend(
         fileEntity: DriveItemEntity,
-        destLocalFile: File
+        destLocalFile: File,
+        onProgress: ((Float) -> Unit)? = null
     ): Boolean {
         val rootChat = ensureReadyChatIdSuspend()
         val chatId = if (fileEntity.parentChatId == 0L) rootChat else fileEntity.parentChatId
@@ -4274,17 +4723,55 @@ class DriveRepository @Inject constructor(
         } ?: return false
 
         var downloadedCachePath = tdFile.local.path
+        val fileId = tdFile.id
         if (!tdFile.local.isDownloadingCompleted || downloadedCachePath.isEmpty() || !File(downloadedCachePath).exists()) {
-            // Download synchronously with TdApi.DownloadFile(..., synchronous = true)
-            val dlRes = sendTdSuspend(TdApi.DownloadFile(tdFile.id, 16, 0, 0, true))
-            if (dlRes is TdApi.File && dlRes.local.isDownloadingCompleted && dlRes.local.path.isNotEmpty()) {
-                downloadedCachePath = dlRes.local.path
-                driveDao.updateLocalPathByUniqueId(dlRes.remote.uniqueId, downloadedCachePath)
-            } else {
-                return false
+            activeSyncDownloadFileIds.add(fileId)
+            try {
+                // Start non-blocking download and monitor progress so cancellation is immediate
+                sendTdSuspend(TdApi.DownloadFile(fileId, 16, 0, 0, false))
+                var lastProgressMs = System.currentTimeMillis()
+                var lastBytes = -1L
+                while (true) {
+                    kotlinx.coroutines.currentCoroutineContext().let { ctx ->
+                        if (!ctx[kotlinx.coroutines.Job]!!.isActive) throw kotlinx.coroutines.CancellationException()
+                    }
+                    val fObj = sendTdSuspend(TdApi.GetFile(fileId)) as? TdApi.File ?: break
+                    if (fObj.local.isDownloadingCompleted && fObj.local.path.isNotEmpty() && File(fObj.local.path).exists()) {
+                        downloadedCachePath = fObj.local.path
+                        driveDao.updateLocalPathByUniqueId(fObj.remote.uniqueId, downloadedCachePath)
+                        onProgress?.invoke(1.0f)
+                        break
+                    }
+                    val dlBytes = fObj.local.downloadedSize
+                    val total = maxOf(fObj.expectedSize, fObj.size, fileEntity.size)
+                    if (dlBytes > lastBytes) {
+                        lastBytes = dlBytes
+                        lastProgressMs = System.currentTimeMillis()
+                    }
+                    if (total > 0L) {
+                        onProgress?.invoke((dlBytes.toFloat() / total.toFloat()).coerceIn(0f, 0.99f))
+                    }
+                    if (!fObj.local.isDownloadingActive && !fObj.local.isDownloadingCompleted) {
+                        // Re-trigger once if needed, or break if stalled
+                        if (System.currentTimeMillis() - lastProgressMs > 15_000L) break
+                        sendTdSuspend(TdApi.DownloadFile(fileId, 16, 0, 0, false))
+                    }
+                    if (System.currentTimeMillis() - lastProgressMs > 120_000L) {
+                        telegramClient.send(TdApi.CancelDownloadFile(fileId, false)) {}
+                        break
+                    }
+                    kotlinx.coroutines.delay(400L)
+                }
+            } catch (ce: kotlinx.coroutines.CancellationException) {
+                telegramClient.send(TdApi.CancelDownloadFile(fileId, false)) {}
+                throw ce
+            } finally {
+                activeSyncDownloadFileIds.remove(fileId)
+                liveFileDownloadBytes.remove(fileId)
             }
         }
 
+        if (downloadedCachePath.isEmpty()) return false
         val srcFile = File(downloadedCachePath)
         if (!srcFile.exists()) return false
 
@@ -4300,6 +4787,7 @@ class DriveRepository @Inject constructor(
             }
             // Restore exact original creation/capture timestamp on local filesystem & MediaStore!
             FileUtils.restoreOriginalTimestampAndScan(context, destLocalFile, fileEntity.createdAt)
+            onProgress?.invoke(1.0f)
             true
         } catch (e: Exception) {
             Log.e("DriveRepo", "Sync download copy failed: ${e.message}")

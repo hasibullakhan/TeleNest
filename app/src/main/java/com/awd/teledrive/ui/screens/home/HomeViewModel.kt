@@ -101,10 +101,17 @@ class HomeViewModel @Inject constructor(
 
     val activeTransfers: StateFlow<List<TransferInfo>> = transferRepository.transfers
         .map { map ->
-            map.values.filter {
-                it.status == TransferRepository.Status.DOWNLOADING ||
-                    it.status == TransferRepository.Status.UPLOADING ||
-                    it.status == TransferRepository.Status.QUEUED
+            map.values.mapNotNull { info ->
+                if (info.status == TransferRepository.Status.DOWNLOADING ||
+                    info.status == TransferRepository.Status.UPLOADING ||
+                    info.status == TransferRepository.Status.QUEUED
+                ) {
+                    // Quantize progress to 1% steps so HomeScreen doesn't recompose 60 times/sec on sub-percent float updates
+                    val quantizedProgress = ((info.progress * 100f).toInt().coerceIn(0, 100)) / 100f
+                    info.copy(progress = quantizedProgress)
+                } else {
+                    null
+                }
             }
         }
         .distinctUntilChanged()
@@ -370,19 +377,23 @@ class HomeViewModel @Inject constructor(
         }
     }
 
-    fun fetchItems() {
+    fun fetchItems(forceRefresh: Boolean = false) {
         viewModelScope.launch {
-            if (items.value.isEmpty()) _isInitialLoading.value = true
-            else _isRefreshing.value = true
+            val hasLocalItems = items.value.isNotEmpty()
+            if (!hasLocalItems) {
+                _isInitialLoading.value = true
+            } else if (forceRefresh) {
+                _isRefreshing.value = true
+            }
             _isSyncingMetadata.value = true
 
-            driveRepository.fetchFiles(_currentFolderId.value)
+            driveRepository.fetchFiles(_currentFolderId.value, forceRefresh = forceRefresh)
 
-            if (_currentFolderId.value == null) {
-                kotlinx.coroutines.withTimeoutOrNull(30000) {
+            if (_currentFolderId.value == null && !hasLocalItems) {
+                kotlinx.coroutines.withTimeoutOrNull(15000) {
                     driveRepository.getSavedMessagesChatIdFlow().collect { id ->
                         if (id != 0L) {
-                            kotlinx.coroutines.delay(3000)
+                            kotlinx.coroutines.delay(600)
                             _isSyncingMetadata.value = false
                             _isInitialLoading.value = false
                             _isRefreshing.value = false
@@ -390,13 +401,17 @@ class HomeViewModel @Inject constructor(
                         }
                     }
                 }
-            } else {
-                kotlinx.coroutines.delay(1000)
+            } else if (forceRefresh) {
+                kotlinx.coroutines.delay(450)
             }
             _isSyncingMetadata.value = false
             _isInitialLoading.value = false
             _isRefreshing.value = false
         }
+    }
+
+    fun refreshItems() {
+        fetchItems(forceRefresh = true)
     }
 
     fun uploadFile(

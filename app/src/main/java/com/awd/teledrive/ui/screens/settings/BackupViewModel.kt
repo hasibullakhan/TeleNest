@@ -94,8 +94,8 @@ class BackupViewModel @Inject constructor(
             _isLoadingRemoteFolders.value = true
             try {
                 val rootChat = driveRepository.ensureReadyChatIdSuspend()
-                val baseChatId = parentOption?.chatId ?: rootChat
-                val baseVfId = parentOption?.virtualFolderId ?: "0"
+                val baseChatId = parentOption?.chatId?.takeIf { it != 0L } ?: rootChat
+                val baseVfId = parentOption?.virtualFolderId?.ifBlank { "0" } ?: "0"
                 val newVfId = driveRepository.ensureVirtualFolderPathSuspend(
                     baseChatId = baseChatId,
                     baseVirtualFolderId = baseVfId,
@@ -103,14 +103,22 @@ class BackupViewModel @Inject constructor(
                 )
                 val allUpdated = driveRepository.getAllSelectableRemoteFoldersSuspend()
                 _remoteFolderOptions.value = allUpdated
-                val createdOption = allUpdated.firstOrNull { it.virtualFolderId == newVfId }
-                    ?: DriveRepository.RemoteFolderOption(
-                        displayName = cleanName,
-                        fullPath = if (parentOption == null || parentOption.fullPath == "/") "/$cleanName" else "${parentOption.fullPath}/$cleanName",
-                        chatId = baseChatId,
-                        virtualFolderId = newVfId,
-                        parentVirtualId = baseVfId
-                    )
+                val expectedFullPath = if (parentOption == null || parentOption.fullPath == "/") {
+                    "/$cleanName"
+                } else {
+                    "${parentOption.fullPath.trimEnd('/')}/$cleanName"
+                }
+                val createdOption = allUpdated.firstOrNull {
+                    it.virtualFolderId == newVfId || it.fullPath.equals(expectedFullPath, ignoreCase = true)
+                } ?: DriveRepository.RemoteFolderOption(
+                    displayName = cleanName,
+                    fullPath = expectedFullPath,
+                    chatId = baseChatId,
+                    virtualFolderId = newVfId,
+                    parentVirtualId = baseVfId,
+                    folderKey = "vf_$newVfId",
+                    parentFolderKey = parentOption?.folderKey ?: "ROOT"
+                )
                 withContext(Dispatchers.Main) {
                     onCreated(createdOption)
                 }

@@ -84,6 +84,7 @@ import java.util.Calendar
 import java.util.Date
 import java.util.Locale
 
+@androidx.compose.runtime.Immutable
 data class MediaDateSection(
     val key: String,
     val title: String,
@@ -92,7 +93,7 @@ data class MediaDateSection(
     val items: List<DriveItem.File>
 )
 
-private fun groupMediaChronologically(items: List<DriveItem.File>): List<MediaDateSection> {
+internal fun groupMediaChronologicallyFast(items: List<DriveItem.File>): List<MediaDateSection> {
     if (items.isEmpty()) return emptyList()
 
     val nowCal = Calendar.getInstance()
@@ -112,17 +113,16 @@ private fun groupMediaChronologically(items: List<DriveItem.File>): List<MediaDa
     val grouped = LinkedHashMap<String, Triple<String, String?, Boolean>>()
     val itemsByKey = LinkedHashMap<String, MutableList<DriveItem.File>>()
 
-    val sortedItems = items.sortedByDescending {
-        if (it.createdAt > 0L) it.createdAt else it.id
-    }
+    val itemCal = Calendar.getInstance()
+    val dateObj = Date()
 
-    for (file in sortedItems) {
+    for (file in items) {
         val ts = if (file.createdAt > 0L) file.createdAt else System.currentTimeMillis()
-        val itemCal = Calendar.getInstance().apply { timeInMillis = ts }
+        itemCal.timeInMillis = ts
         val year = itemCal.get(Calendar.YEAR)
         val month = itemCal.get(Calendar.MONTH)
         val dayOfYear = itemCal.get(Calendar.DAY_OF_YEAR)
-        val dateObj = Date(ts)
+        dateObj.time = ts
 
         val sectionKey: String
         val title: String
@@ -182,10 +182,12 @@ fun MediaScreen(
     viewModel: MediaViewModel = hiltViewModel()
 ) {
     val mediaItems by viewModel.mediaItems.collectAsState()
+    val mediaSections by viewModel.mediaSections.collectAsState()
     val folders by viewModel.folders.collectAsState()
 
     MediaContent(
         mediaItems = mediaItems,
+        precomputedSections = mediaSections,
         folders = folders,
         onNavigateToPreview = onNavigateToPreview,
         onDownload = viewModel::downloadFile,
@@ -200,6 +202,7 @@ fun MediaScreen(
 @Composable
 fun MediaContent(
     mediaItems: List<DriveItem.File>,
+    precomputedSections: List<MediaDateSection>? = null,
     folders: List<DriveItem.Folder>,
     onNavigateToPreview: (DriveItem.File) -> Unit,
     onDownload: (DriveItem.File) -> Unit,
@@ -219,8 +222,8 @@ fun MediaContent(
     var isCopyOperation by remember { mutableStateOf(false) }
     var showDeleteConfirm by remember { mutableStateOf(false) }
 
-    val dateSections = remember(mediaItems) {
-        groupMediaChronologically(mediaItems)
+    val dateSections = remember(precomputedSections, mediaItems) {
+        precomputedSections ?: groupMediaChronologicallyFast(mediaItems)
     }
 
     if (showDeleteConfirm) {
@@ -562,10 +565,15 @@ fun MediaGridItem(
     val thumbPath = item.thumbnailPath ?: item.localPath
     val imageRequest = remember(thumbPath) {
         thumbPath?.let {
+            val cacheKey = "media_thumb_$it"
             ImageRequest.Builder(context)
                 .data(it)
                 .size(220)
-                .crossfade(true)
+                .precision(coil.size.Precision.INEXACT)
+                .allowRgb565(true)
+                .memoryCacheKey(cacheKey)
+                .diskCacheKey(cacheKey)
+                .crossfade(100)
                 .build()
         }
     }
