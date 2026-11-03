@@ -8,7 +8,8 @@ object BiometricHelper {
     fun showPrompt(
         activity: FragmentActivity,
         title: String,
-        onSuccess: () -> Unit,
+        cryptoObject: BiometricPrompt.CryptoObject,
+        onAuthenticated: (BiometricPrompt.CryptoObject) -> Unit,
         onError: (String) -> Unit
     ) {
         val executor = ContextCompat.getMainExecutor(activity)
@@ -21,7 +22,11 @@ object BiometricHelper {
 
                 override fun onAuthenticationSucceeded(result: BiometricPrompt.AuthenticationResult) {
                     super.onAuthenticationSucceeded(result)
-                    onSuccess()
+                    val authenticatedCryptoObject = result.cryptoObject ?: run {
+                        onError("Authentication failed")
+                        return
+                    }
+                    onAuthenticated(authenticatedCryptoObject)
                 }
 
                 override fun onAuthenticationFailed() {
@@ -29,13 +34,11 @@ object BiometricHelper {
                     onError("Authentication failed")
                 }
             })
-
         val promptInfo = BiometricPrompt.PromptInfo.Builder()
             .setTitle(title)
             .setSubtitle("Log in using your biometric credential")
             .setNegativeButtonText("Use master password")
             .build()
-
-        biometricPrompt.authenticate(promptInfo)
+        biometricPrompt.authenticate(promptInfo, cryptoObject)
     }
 }
