@@ -85,8 +85,8 @@ class BiometricCrypto @Inject constructor(
         return try {
             val iv = cipher.iv ?: return false
             val encrypted = cipher.doFinal(password.toByteArray(Charsets.UTF_8))
-            secureSettings.setString(PREF_CIPHERTEXT, Base64.encodeToString(encrypted, Base64.NO_WRAP))
-            secureSettings.setString(PREF_IV, Base64.encodeToString(iv, Base64.NO_WRAP))
+            secureSettings.saveString(PREF_CIPHERTEXT, Base64.encodeToString(encrypted, Base64.NO_WRAP))
+            secureSettings.saveString(PREF_IV, Base64.encodeToString(iv, Base64.NO_WRAP))
             true
         } catch (e: Exception) {
             false
@@ -95,8 +95,8 @@ class BiometricCrypto @Inject constructor(
 
     fun clearBiometricCredential() {
         try {
-            secureSettings.setString(PREF_CIPHERTEXT, "")
-            secureSettings.setString(PREF_IV, "")
+            secureSettings.saveString(PREF_CIPHERTEXT, "")
+            secureSettings.saveString(PREF_IV, "")
             val keyStore = KeyStore.getInstance("AndroidKeyStore")
             keyStore.load(null)
             if (keyStore.containsAlias(KEY_ALIAS)) keyStore.deleteEntry(KEY_ALIAS)
