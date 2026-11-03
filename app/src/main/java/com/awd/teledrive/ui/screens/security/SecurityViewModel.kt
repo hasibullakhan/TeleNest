@@ -14,7 +14,7 @@ import javax.inject.Inject
 class SecurityViewModel @Inject constructor(
     private val masterPasswordService: MasterPasswordService,
     private val secureSettings: SecureSettings,
-    private val secureSessionManager: SecureSessionManager
+    private val secureSessionManager: SecureSessionManager, private val biometricCrypto: com.awd.teledrive.data.secure.BiometricCrypto
 ) : ViewModel() {
 
     private val _isPasswordSet = MutableStateFlow(masterPasswordService.isPasswordSet())
@@ -64,7 +64,7 @@ class SecurityViewModel @Inject constructor(
         secureSessionManager.clearSession()
     }
 
-    fun unlockWithBiometric(): Boolean {
+    fun getBiometricCrypto(): com.awd.teledrive.data.secure.BiometricCrypto.Crypto? = try { biometricCrypto.createCrypto() } catch (e: Exception) { null }; fun unlockWithBiometricCipher(cipher: javax.crypto.Cipher): Boolean { val password = if (biometricCrypto.hasBiometricCredential()) biometricCrypto.decryptPassword(cipher) else masterPasswordService.getStoredPassword()?.let { stored -> if (biometricCrypto.enrollPassword(stored, cipher)) stored else null }; if (password == null) return false; secureSessionManager.setSessionPassword(password); return true }; fun unlockWithBiometric(): Boolean {
         val storedPassword = masterPasswordService.getStoredPassword()
         return if (storedPassword != null) {
             secureSessionManager.setSessionPassword(storedPassword)
