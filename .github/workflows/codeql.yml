@@ -43,7 +43,7 @@ jobs:
         with:
           languages: java-kotlin
       - name: Build debug with Gradle
-        run: gradle assembleDebug -x lint
+        run: gradle assembleDebug -x lint --no-build-cache --rerun-tasks
       - name: Perform CodeQL Analysis
         uses: github/codeql-action/analyze@v3
         with:
