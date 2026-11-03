@@ -168,7 +168,7 @@ fun NavGraph(navController: NavHostController) {
                     if (activity != null) {
                         BiometricPrompt(activity, executor, object : BiometricPrompt.AuthenticationCallback() {
                             override fun onAuthenticationSucceeded(result: BiometricPrompt.AuthenticationResult) {
-                                if (securityViewModel.unlockWithBiometric()) {
+                                val biometricCipher = result.cryptoObject?.cipher; if (biometricCipher != null && securityViewModel.unlockWithBiometricCipher(biometricCipher)) {
                                     navController.navigate(Screen.SecureStorage.route)
                                 } else {
                                     android.widget.Toast.makeText(context, context.getString(R.string.password_unsynced_toast), android.widget.Toast.LENGTH_LONG).show()
@@ -220,7 +220,7 @@ fun NavGraph(navController: NavHostController) {
                                                     val isBiometricEnabled = securityViewModel.isBiometricEnabled.value
                                                     if (isBiometricEnabled && biometricPrompt != null) {
                                                         try {
-                                                            biometricPrompt.authenticate(promptInfo)
+                                                            val biometricCrypto = securityViewModel.getBiometricCrypto(); if (biometricCrypto != null) biometricPrompt.authenticate(promptInfo, biometricCrypto.cryptoObject) else showUnlockDialog = true
                                                         } catch (e: Exception) {
                                                             showUnlockDialog = true
                                                         }
