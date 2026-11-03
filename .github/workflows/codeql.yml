@@ -42,8 +42,8 @@ jobs:
         uses: github/codeql-action/init@v3
         with:
           languages: java-kotlin
-      - name: Build with Gradle
-        run: gradle build -x lint
+      - name: Build debug with Gradle
+        run: gradle assembleDebug -x lint
       - name: Perform CodeQL Analysis
         uses: github/codeql-action/analyze@v3
         with:
