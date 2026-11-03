@@ -59,11 +59,11 @@ fun MasterPasswordScreen(
     LaunchedEffect(isPasswordSet, isBiometricEnabled) {
         if (isPasswordSet && isBiometricEnabled) {
             val activity = context as? FragmentActivity
-            if (activity != null) {
+            val biometricCrypto = viewModel.getBiometricCrypto(); if (activity == null || biometricCrypto == null) return@LaunchedEffect; if (activity != null) {
                 BiometricHelper.showPrompt(
                     activity, 
-                    title = context.getString(R.string.biometric_login_title),
-                    onSuccess = onSuccess, 
+                    title = context.getString(R.string.biometric_login_title), cryptoObject = biometricCrypto.cryptoObject,
+                    onAuthenticated = { authenticated -> val cipher = authenticated.cipher; if (cipher != null && viewModel.unlockWithBiometricCipher(cipher)) onSuccess() }, 
                     onError = { }
                 )
             }
