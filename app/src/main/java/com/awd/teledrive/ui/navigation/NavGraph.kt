@@ -45,6 +45,7 @@ import androidx.navigation.compose.composable
 import androidx.navigation.compose.currentBackStackEntryAsState
 import androidx.navigation.navArgument
 import com.awd.teledrive.R
+import com.awd.teledrive.core.BiometricHelper
 import com.awd.teledrive.ui.screens.auth.LoginScreen
 import com.awd.teledrive.ui.screens.home.HomeScreen
 import com.awd.teledrive.ui.screens.logs.LogsScreen
@@ -162,30 +163,6 @@ fun NavGraph(navController: NavHostController) {
             if (shouldShowBottomBar) {
                 val context = LocalContext.current
                 val activity = context as? FragmentActivity
-                val executor = remember { ContextCompat.getMainExecutor(context) }
-                
-                val biometricPrompt = remember {
-                    if (activity != null) {
-                        BiometricPrompt(activity, executor, object : BiometricPrompt.AuthenticationCallback() {
-                            override fun onAuthenticationSucceeded(result: BiometricPrompt.AuthenticationResult) {
-                                if (securityViewModel.unlockWithBiometric()) {
-                                    navController.navigate(Screen.SecureStorage.route)
-                                } else {
-                                    android.widget.Toast.makeText(context, context.getString(R.string.password_unsynced_toast), android.widget.Toast.LENGTH_LONG).show()
-                                    showUnlockDialog = true
-                                }
-                            }
-                        })
-                    } else null
-                }
-
-                val promptInfo = remember {
-                    BiometricPrompt.PromptInfo.Builder()
-                        .setTitle(context.getString(R.string.unlock_secure_folder))
-                        .setSubtitle(context.getString(R.string.biometric_subtitle))
-                        .setNegativeButtonText(context.getString(R.string.use_password))
-                        .build()
-                }
 
                 NavigationBar(
                     containerColor = MaterialTheme.colorScheme.surfaceContainerLow
@@ -218,9 +195,31 @@ fun NavGraph(navController: NavHostController) {
                                                     android.widget.Toast.makeText(navController.context, navController.context.getString(R.string.secure_mode_disabled), android.widget.Toast.LENGTH_SHORT).show()
                                                 } else {
                                                     val isBiometricEnabled = securityViewModel.isBiometricEnabled.value
-                                                    if (isBiometricEnabled && biometricPrompt != null) {
+                                                    val cipher = if (isBiometricEnabled && activity != null) {
+                                                        securityViewModel.createBiometricCipher()
+                                                    } else null
+                                                    if (cipher != null && activity != null) {
                                                         try {
-                                                            biometricPrompt.authenticate(promptInfo)
+                                                            BiometricHelper.showPrompt(
+                                                                activity,
+                                                                title = context.getString(R.string.unlock_secure_folder),
+                                                                subtitle = context.getString(R.string.biometric_subtitle),
+                                                                negativeText = context.getString(R.string.use_password),
+                                                                cipher = cipher,
+                                                                onAuthenticated = { authenticated ->
+                                                                    if (securityViewModel.unlockWithBiometricCipher(authenticated)) {
+                                                                        navController.navigate(Screen.SecureStorage.route)
+                                                                    } else {
+                                                                        android.widget.Toast.makeText(context, context.getString(R.string.password_unsynced_toast), android.widget.Toast.LENGTH_LONG).show()
+                                                                        showUnlockDialog = true
+                                                                    }
+                                                                },
+                                                                onError = { code, _ ->
+                                                                    if (code == BiometricPrompt.ERROR_NEGATIVE_BUTTON) {
+                                                                        showUnlockDialog = true
+                                                                    }
+                                                                }
+                                                            )
                                                         } catch (e: Exception) {
                                                             showUnlockDialog = true
                                                         }
