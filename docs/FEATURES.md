@@ -47,7 +47,7 @@ TeleNest uses a dual-folder model:
 ### 2.2 24-Color Custom Folder Palette
 - Choose from 24 Material Design 3 inspired colors:
   `Red`, `Pink`, `Purple`, `Deep Purple`, `Indigo`, `Blue`, `Light Blue`, `Cyan`, `Teal`, `Green`, `Light Green`, `Lime`, `Yellow`, `Amber`, `Orange`, `Deep Orange`, `Brown`, `Grey`, `Blue Grey`, `Pure Black`, `Sapphire`, `Emerald`, `Ruby`, `Gold`.
-- Colors persist in the local SQLCipher database and synchronize across sessions via the cloud manifest.
+- Colors persist in the local database and synchronize across sessions via the cloud manifest.
 
 ### 2.3 Dual Layout Modes
 - **Grid View:** Responsive cards featuring folder accent colors, live recursive item counts, cumulative folder sizes (`X files • Y MB`), and high-definition photo/video thumbnail previews.
@@ -71,18 +71,21 @@ TeleNest uses a dual-folder model:
 ## 3. Zero-Knowledge Client-Side Encryption Vault
 
 ### 3.1 Military-Grade E2EE
-- **Libsodium (`lazysodium-android`):** Implements **AES-256-GCM** and **XChaCha20-Poly1305** symmetric authenticated encryption.
-- **Argon2id Key Derivation:** Master passwords are processed through memory-hard Argon2id key derivation, providing robust defense against GPU/ASIC brute-force attacks.
-- **Zero-Knowledge Architecture:** Neither Telegram nor any entity with physical access to your cloud files can decipher encrypted records without your private key.
+- **AES-256-GCM (`javax.crypto`):** Vault files are encrypted with authenticated AES-256-GCM before upload.
+- **PBKDF2-HMAC-SHA256 key derivation:** 250,000 iterations with a random per-file salt. The file header (format version and iteration count) is authenticated. Files from older versions (10,000 iterations, no header) remain readable.
+- **Argon2id master-password hash:** The master password itself is only verified against an Argon2id hash (64 MB, 2 passes).
+- **Zero-knowledge towards Telegram:** Telegram only ever receives the encrypted blob.
 
-### 3.2 SQLCipher Encrypted Local Storage
-- Local file caches, thumbnail mappings, and folder indexes are stored in a SQLite database encrypted with 256-bit AES SQLCipher.
+### 3.2 Encrypted Settings Storage
+- Preferences, API credentials and master-password data live in `EncryptedSharedPreferences` (Android Keystore-backed AES-256).
+- The Room cache (file and folder metadata) is not encrypted. SQLCipher support is on the roadmap.
 
 ### 3.3 Biometric & Master PIN Security
-- Integrated with `AndroidX BiometricPrompt`.
-- Unlocks with fingerprint, 3D face recognition, or a fallback master PIN.
-- Automatic inactivity timeout locks the vault when the application loses focus.
-- Optional `FLAG_SECURE` prevents system screenshots and screen recording inside the vault.
+- Integrated with `AndroidX BiometricPrompt` using a **CryptoObject**: the prompt is bound to an AES-GCM key in the Android Keystore that needs a fresh biometric authentication for every use.
+- A biometric success only unlocks the app when that Keystore cipher actually decrypts the stored credential; a prompt without a valid cipher is treated as an error.
+- Enrolling a new fingerprint or face invalidates the key. The master password is then required once, after which biometrics can be enabled again.
+- Unlocks with fingerprint or face (device strong biometrics), with the master password as fallback.
+- The app locks after it has been in the background for more than 30 seconds.
 
 ---
 
@@ -112,23 +115,19 @@ TeleNest uses a dual-folder model:
 
 ### 5.1 Video Streaming (AndroidX Media3 / ExoPlayer)
 - Instant cloud streaming without downloading the entire file first.
-- Vertical swipe gestures: Left side for screen brightness, right side for audio volume.
-- Horizontal double-tap to seek ±10 seconds.
-- Picture-in-Picture (PiP) support for background watching while multitasking.
-- Multi-speed playback: 0.25x, 0.5x, 0.75x, 1.0x, 1.25x, 1.5x, 2.0x.
+- Standard Media3 player controls (play/pause, seek bar, fullscreen layout).
+- "Open with" hands the file to another installed player.
 
-### 5.2 Background Audio Player
-- Plays audio files with background lock-screen controls and notification scrubbers.
-- Supports MP3, FLAC, AAC, WAV, OGG, M4A.
+### 5.2 Audio Playback
+- Audio files (MP3, FLAC, AAC, WAV, OGG, M4A) play in the same Media3 player.
 
 ### 5.3 High-Resolution Photo Gallery
 - Built with **Coil** for smooth image decoding and caching.
 - Multi-touch pinch-to-zoom and double-tap zoom.
-- EXIF metadata inspector: Displays camera model, focal length, ISO, exposure, resolution, and GPS coordinates (if available).
 
 ### 5.4 Native PDF & Document Viewer
 - High-fidelity PDF rendering with smooth scroll and zoom.
-- Syntax highlighting for source code (`.kt`, `.java`, `.py`, `.json`, `.xml`, `.html`, `.js`, `.md`).
+- Plain-text viewer for source code, logs, JSON and Markdown files.
 
 ### 5.5 APK Inspector & Installer
 - Reads `AndroidManifest.xml` from APK files directly from cloud/cache.
@@ -230,6 +229,6 @@ Full support for 11 languages with on-the-fly switching:
 
 ### 12.2 Strict Per-Account Data & Database Isolation
 - **TDLib Session Isolation:** Each account slot uses its own isolated native TDLib database and file cache directory (`tdlib` for the primary slot and `tdlib_slot_<slotId>` for additional accounts).
-- **Dynamic Room Database Switching (`AccountDatabaseManager`):** Each account maintains its own SQLCipher-encrypted Room database (`teledrive.db` / `teledrive_slot_<slotId>.db`). `SwitchableDriveDao` uses `activeSlotId.flatMapLatest` so all UI Flows reactively switch to the selected account's database with zero data leakage.
+- **Dynamic Room Database Switching (`AccountDatabaseManager`):** Each account maintains its own Room database (`teledrive.db` / `teledrive_slot_<slotId>.db`). `SwitchableDriveDao` uses `activeSlotId.flatMapLatest` so all UI Flows reactively switch to the selected account's database with zero data leakage.
 - **Per-Account Cloud Manifests:** Virtual folders, folder color palettes, and cloud sync states are scoped per account (`teledrive_manifest_prefs_<slotId>`).
 

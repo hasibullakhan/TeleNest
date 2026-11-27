@@ -60,12 +60,20 @@ fun MasterPasswordScreen(
         if (isPasswordSet && isBiometricEnabled) {
             val activity = context as? FragmentActivity
             if (activity != null) {
-                BiometricHelper.showPrompt(
-                    activity, 
-                    title = context.getString(R.string.biometric_login_title),
-                    onSuccess = onSuccess, 
-                    onError = { }
-                )
+                val cipher = viewModel.createBiometricCipher()
+                if (cipher != null) {
+                    BiometricHelper.showPrompt(
+                        activity,
+                        title = context.getString(R.string.biometric_login_title),
+                        subtitle = context.getString(R.string.biometric_subtitle),
+                        negativeText = context.getString(R.string.use_password),
+                        cipher = cipher,
+                        onAuthenticated = { authenticated ->
+                            if (viewModel.unlockAppWithBiometricCipher(authenticated)) onSuccess()
+                        },
+                        onError = { _, _ -> }
+                    )
+                }
             }
         }
     }
