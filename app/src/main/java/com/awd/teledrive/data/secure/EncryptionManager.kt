@@ -141,25 +141,33 @@ class EncryptionManager @Inject constructor() {
             cipher.init(Cipher.DECRYPT_MODE, key, GCMParameterSpec(TAG_LENGTH_BIT, iv))
             if (header != null) cipher.updateAAD(header)
 
-            CipherInputStream(fis, cipher).use { cis ->
-                FileOutputStream(outputFile).use { fos ->
-                    val buffer = ByteArray(65536)
-                    var bytesRead = cis.read(buffer)
-                    while (bytesRead != -1) {
-                        fos.write(buffer, 0, bytesRead)
-                        processedBytes += bytesRead
+            val temporary = File.createTempFile("decrypt_", ".tmp", outputFile.absoluteFile.parentFile)
+            try {
+                CipherInputStream(fis, cipher).use { cis ->
+                    FileOutputStream(temporary).use { fos ->
+                        val buffer = ByteArray(65536)
+                        var bytesRead = cis.read(buffer)
+                        while (bytesRead != -1) {
+                            fos.write(buffer, 0, bytesRead)
+                            processedBytes += bytesRead
 
-                        if (totalSize > 0) {
-                            val currentProgress = processedBytes.toFloat() / totalSize.toFloat()
-                            if (currentProgress - lastReportedProgress >= 0.02f || currentProgress >= 1f) {
-                                onProgress(currentProgress)
-                                lastReportedProgress = currentProgress
-                                kotlinx.coroutines.yield()
+                            if (totalSize > 0) {
+                                val currentProgress = processedBytes.toFloat() / totalSize.toFloat()
+                                if (currentProgress - lastReportedProgress >= 0.02f || currentProgress >= 1f) {
+                                    onProgress(currentProgress)
+                                    lastReportedProgress = currentProgress
+                                    kotlinx.coroutines.yield()
+                                }
                             }
+                            bytesRead = cis.read(buffer)
                         }
-                        bytesRead = cis.read(buffer)
                     }
                 }
+                // Same-directory rename replaces the destination only after tag verification succeeds.
+                if (!temporary.renameTo(outputFile)) throw java.io.IOException("Could not save decrypted file")
+                onProgress(1f)
+            } finally {
+                temporary.delete()
             }
         }
     }

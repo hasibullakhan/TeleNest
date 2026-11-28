@@ -23,6 +23,7 @@ import com.awd.teledrive.domain.model.VirtualFolder
 import dagger.hilt.android.qualifiers.ApplicationContext
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.sync.withLock
 import kotlinx.coroutines.FlowPreview
 import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.flow.Flow
@@ -56,6 +57,7 @@ class DriveRepository @Inject constructor(
     @param:ApplicationContext private val context: Context
 ) {
     private val scope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
+    private val splitUploadMutex = kotlinx.coroutines.sync.Mutex()
     private var savedMessagesChatId: Long = 0
     private val _savedMessagesChatIdFlow = MutableStateFlow(0L)
     fun getSavedMessagesChatIdFlow(): Flow<Long> = _savedMessagesChatIdFlow.asStateFlow()
@@ -2309,42 +2311,50 @@ class DriveRepository @Inject constructor(
         val otimeTag = if (originalTimestampMillis > 0L) "[OTIME:$originalTimestampMillis]" else ""
         val shouldEncrypt = encryptFile || isChatSecure(targetChatId) || (virtualFolderId != null && isVirtualFolderSecure(virtualFolderId))
         if (sourceFile.length() > FileUtils.MAX_FILE_SIZE) {
-            if (!FileUtils.hasEnoughSpace(context, sourceFile.length())) return
             startTransferService()
             scope.launch {
-                val placeholderId = "prep_${System.currentTimeMillis()}"
-                transferRepository.addTransfer(0, placeholderId, originalFileName, false, sourceFile.length(), status = context.getString(R.string.splitting_file, ""))
-                try {
-                    val parts = FileUtils.splitFile(context, sourceFile) { progress ->
-                        transferRepository.updateTransferManual(placeholderId, progress, context.getString(R.string.splitting_file_perc, (progress * 100).toInt()))
+                splitUploadMutex.withLock {
+                    if (!FileUtils.hasEnoughSpace(context, sourceFile.length())) {
+                        transferRepository.addTransfer(
+                            0, "prep_" + System.nanoTime(), originalFileName, false,
+                            sourceFile.length(), status = TransferRepository.Status.FAILED
+                        )
+                        return@withLock
                     }
-                    transferRepository.removeTransfer(placeholderId)
-                    val groupId = FileUtils.generateSplitGroupId()
-                    val partMessageIds = mutableListOf<Long>()
-                    
-                    parts.forEachIndexed { index, part ->
-                        val caption = "[TD_SPLIT|ID:$groupId|PART:$index/${parts.size}|NAME:$originalFileName]$vfTag$otimeTag"
-                        uploadSinglePart(
-                            part.absolutePath,
-                            originalFileName,
-                            targetChatId,
-                            caption,
-                            virtualFolderId,
-                            deleteSourceAfter = true,
-                            encryptFile = shouldEncrypt,
-                            sendAsDirectMedia = false,
-                            originalTimestampMillis = originalTimestampMillis
-                        ) { messageId ->
-                            if (messageId != 0L) partMessageIds.add(messageId)
-                            
-                            // If this was the last part, send the Master Metadata
-                            if (index == parts.size - 1) {
-                                sendSplitMasterMetadata(groupId, originalFileName, sourceFile.length(), FileUtils.getMimeType(originalFileName), parts.size, virtualFolderId, shouldEncrypt, partMessageIds, originalTimestampMillis)
+                    val placeholderId = "prep_${System.nanoTime()}"
+                    transferRepository.addTransfer(0, placeholderId, originalFileName, false, sourceFile.length(), status = context.getString(R.string.splitting_file, ""))
+                    try {
+                        val parts = FileUtils.splitFile(context, sourceFile) { progress ->
+                            transferRepository.updateTransferManual(placeholderId, progress, context.getString(R.string.splitting_file_perc, (progress * 100).toInt()), throttled = true)
+                        }
+                        transferRepository.removeTransfer(placeholderId)
+                        val groupId = FileUtils.generateSplitGroupId()
+                        val partMessageIds = mutableListOf<Long>()
+
+                        parts.forEachIndexed { index, part ->
+                            val caption = "[TD_SPLIT|ID:$groupId|PART:$index/${parts.size}|NAME:$originalFileName]$vfTag$otimeTag"
+                            uploadSinglePart(
+                                part.absolutePath,
+                                originalFileName,
+                                targetChatId,
+                                caption,
+                                virtualFolderId,
+                                deleteSourceAfter = true,
+                                encryptFile = shouldEncrypt,
+                                sendAsDirectMedia = false,
+                                originalTimestampMillis = originalTimestampMillis
+                            ) { messageId ->
+                                if (messageId != 0L) partMessageIds.add(messageId)
+
+                                // If this was the last part, send the Master Metadata
+                                if (index == parts.size - 1) {
+                                    sendSplitMasterMetadata(groupId, originalFileName, sourceFile.length(), FileUtils.getMimeType(originalFileName), parts.size, virtualFolderId, shouldEncrypt, partMessageIds, originalTimestampMillis)
+                                }
                             }
                         }
+                    } catch (e: Exception) {
+                        transferRepository.updateTransferManual(placeholderId, 0f, context.getString(R.string.split_fail))
                     }
-                } catch (e: Exception) {
-                    transferRepository.updateTransferManual(placeholderId, 0f, context.getString(R.string.split_fail))
                 }
             }
         } else {
@@ -2809,7 +2819,14 @@ class DriveRepository @Inject constructor(
                 }
                 FileUtils.restoreOriginalTimestampAndScan(context, dest, file.createdAt)
                 scope.launch(Dispatchers.Main) { Toast.makeText(context, context.getString(R.string.save_success), Toast.LENGTH_SHORT).show() }
-            } catch (e: Exception) { }
+            } catch (error: kotlinx.coroutines.CancellationException) {
+                throw error
+            } catch (error: Exception) {
+                Log.e("DriveRepo", "Could not save file", error)
+                scope.launch(Dispatchers.Main) {
+                    Toast.makeText(context, R.string.save_file_error, Toast.LENGTH_SHORT).show()
+                }
+            }
         }
     }
 

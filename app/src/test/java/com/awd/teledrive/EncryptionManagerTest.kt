@@ -49,7 +49,7 @@ class EncryptionManagerTest {
     fun wrongPassword_isRejected() = runBlocking {
         val plain = tmp.newFile("p.bin").apply { writeBytes(sampleBytes(5000)) }
         val enc = tmp.newFile("e.bin")
-        val dec = tmp.newFile("d.bin")
+        val dec = tmp.newFile("d.bin").apply { writeText("existing download") }
         manager.encryptFile(plain, enc, "right-password")
         try {
             manager.decryptFile(enc, dec, "wrong-password")
@@ -57,6 +57,7 @@ class EncryptionManagerTest {
         } catch (e: Exception) {
             // expected: GCM authentication failure
         }
+        assertEquals("existing download", dec.readText())
     }
 
     @Test

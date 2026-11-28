@@ -14,7 +14,7 @@ Package/applicationId: `com.awd.teledrive` (never change it, it would become a d
 2. Open a PR to `main` and merge it (the owner authorised Claude to do this).
 3. To publish an update, bump `versionName` AND `versionCode` in `app/build.gradle.kts` in that PR. A change to that file on `main` triggers `Build & Release APK` (`release.yml`), which builds the signed APK and creates the GitHub Release `vX.Y.Z` with `TeleNest-vX.Y.Z.apk`.
 4. Installed apps read `releases/latest` and offer "Update Now" when the tag is newer. Android only accepts the update if `versionCode` is higher and the APK is signed with the same key.
-- Current version: 3.4.0 (versionCode 46). Next release must use a higher versionCode.
+- Current version: 3.5.0 (versionCode 47). Next release must use a higher versionCode.
 - Signing secrets live in GitHub Actions Secrets: `KEYSTORE_BASE64`, `STORE_PASSWORD`, `KEY_PASSWORD` (alias `upload`). Claude cannot read or set Secrets (the proxy blocks that API).
 - **Never commit a keystore, password or token.** `*.jks`, `debug.keystore*` are git-ignored.
 

@@ -7,14 +7,14 @@
 **A Native, Privacy-First Unlimited Cloud Drive for Android Powered by Telegram MTProto & TDLib**
 
 [![Latest Release](https://img.shields.io/github/v/release/hasibullakhan/TeleNest?style=for-the-badge&logo=github&color=0088CC)](https://github.com/hasibullakhan/TeleNest/releases/latest)
-[![Download APK](https://img.shields.io/badge/Download-APK%20v3.4.0-24A1DE?style=for-the-badge&logo=android&logoColor=white)](https://github.com/hasibullakhan/TeleNest/releases/latest/download/TeleNest-v3.4.0.apk)
+[![Download APK](https://img.shields.io/badge/Download-APK-24A1DE?style=for-the-badge&logo=android&logoColor=white)](https://github.com/hasibullakhan/TeleNest/releases/latest)
 [![Platform](https://img.shields.io/badge/Platform-Android%207.0%2B%20(API%2024%2B)-3DDC84?style=for-the-badge&logo=android&logoColor=white)](https://developer.android.com)
 [![Kotlin](https://img.shields.io/badge/Kotlin-2.0-7F52FF?style=for-the-badge&logo=kotlin&logoColor=white)](https://kotlinlang.org)
 [![Jetpack Compose](https://img.shields.io/badge/UI-Jetpack%20Compose%20M3-4285F4?style=for-the-badge&logo=jetpackcompose&logoColor=white)](https://developer.android.com/jetpack/compose)
 [![Encryption](https://img.shields.io/badge/Security-AES--256--GCM%20%7C%20PBKDF2%20%7C%20Android%20Keystore-E11D48?style=for-the-badge&logo=shield&logoColor=white)](https://github.com/hasibullakhan/TeleNest)
 [![License: MIT](https://img.shields.io/badge/License-MIT-F59E0B?style=for-the-badge)](LICENSE)
 
-[**Download Latest APK (v3.4.0)**](https://github.com/hasibullakhan/TeleNest/releases/latest) • [**Full Feature Guide**](#-detailed-features--capabilities) • [**Report a Bug**](https://github.com/hasibullakhan/TeleNest/issues) • [**Request a Feature**](https://github.com/hasibullakhan/TeleNest/issues) • [**Author Profile**](https://www.facebook.com/HasibullaKhanHK)
+[**Download Latest APK**](https://github.com/hasibullakhan/TeleNest/releases/latest) • [**Full Feature Guide**](#-detailed-features--capabilities) • [**Report a Bug**](https://github.com/hasibullakhan/TeleNest/issues) • [**Request a Feature**](https://github.com/hasibullakhan/TeleNest/issues) • [**Author Profile**](https://www.facebook.com/HasibullaKhanHK)
 
 </div>
 
@@ -27,6 +27,12 @@
 Unlike third-party bots, web wrappers, or cloud middleman services that risk your privacy, TeleNest is a **100% native Android client**. It embeds the official **TDLib (Telegram Database Library)** native engine (`libtdjni.so`), establishing direct, encrypted **MTProto 2.0** connections from your device straight to Telegram's cloud servers. Your phone number, two-factor authentication credentials, encryption keys, and files **never** pass through any third-party intermediary server.
 
 ---
+
+## What's new in TeleNest Flow (v3.5.0)
+
+- Refreshed light and dark themes, a cleaner drive header, and a Transfers screen with separate Uploads and Downloads views.
+- File preparation and batch submission run off the Android UI thread. Preparation shows progress, reports unreadable files, and can be cancelled.
+- Vault exports verify decryption before replacing the destination. Biometric lockout opens the password prompt.
 
 ## ✨ Feature Highlights at a Glance
 

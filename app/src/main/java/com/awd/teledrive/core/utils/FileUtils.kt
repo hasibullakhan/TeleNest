@@ -159,24 +159,29 @@ object FileUtils {
         var bytesProcessed = 0L
         var partIndex = 0
 
-        FileInputStream(sourceFile).use { input ->
-            while (bytesProcessed < totalSize) {
-                val partFile = File(splitDir, "${sourceFile.name}.part$partIndex")
-                var partBytes = 0L
-                FileOutputStream(partFile).use { output ->
-                    while (partBytes < MAX_FILE_SIZE && bytesProcessed < totalSize) {
-                        val toRead = minOf(buffer.size.toLong(), MAX_FILE_SIZE - partBytes).toInt()
-                        val read = input.read(buffer, 0, toRead)
-                        if (read <= 0) break
-                        output.write(buffer, 0, read)
-                        partBytes += read
-                        bytesProcessed += read
-                        onProgress((bytesProcessed.toFloat() / totalSize.toFloat()).coerceIn(0f, 1f))
+        try {
+            FileInputStream(sourceFile).use { input ->
+                while (bytesProcessed < totalSize) {
+                    val partFile = File(splitDir, "${sourceFile.name}.part$partIndex")
+                    var partBytes = 0L
+                    FileOutputStream(partFile).use { output ->
+                        while (partBytes < MAX_FILE_SIZE && bytesProcessed < totalSize) {
+                            val toRead = minOf(buffer.size.toLong(), MAX_FILE_SIZE - partBytes).toInt()
+                            val read = input.read(buffer, 0, toRead)
+                            if (read <= 0) throw java.io.EOFException("Source file changed during split")
+                            output.write(buffer, 0, read)
+                            partBytes += read
+                            bytesProcessed += read
+                            onProgress((bytesProcessed.toFloat() / totalSize.toFloat()).coerceIn(0f, 1f))
+                        }
                     }
+                    parts.add(partFile)
+                    partIndex++
                 }
-                parts.add(partFile)
-                partIndex++
             }
+        } catch (error: Exception) {
+            splitDir.deleteRecursively()
+            throw error
         }
         return parts
     }

@@ -17,6 +17,7 @@ import kotlinx.coroutines.flow.distinctUntilChanged
 import kotlinx.coroutines.flow.flatMapLatest
 import kotlinx.coroutines.flow.map
 import kotlinx.coroutines.flow.stateIn
+import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.launch
 import javax.inject.Inject
 
@@ -206,8 +207,10 @@ class SecureStorageViewModel @Inject constructor(
     }
 
     fun uploadFile(filePath: String, fileName: String) {
-        viewModelScope.launch {
-            driveRepository.uploadFile(filePath, fileName, _currentFolderId.value, _currentVirtualFolderId.value)
+        val chatId = _currentFolderId.value
+        val virtualId = _currentVirtualFolderId.value
+        viewModelScope.launch(Dispatchers.IO) {
+            driveRepository.uploadFile(filePath, fileName, chatId, virtualId)
         }
     }
 

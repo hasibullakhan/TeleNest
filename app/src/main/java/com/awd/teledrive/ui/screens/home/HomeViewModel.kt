@@ -14,7 +14,12 @@ import com.awd.teledrive.data.secure.SecureSessionManager
 import com.awd.teledrive.domain.model.DriveItem
 import com.awd.teledrive.domain.model.MoveCopyDestination
 import dagger.hilt.android.lifecycle.HiltViewModel
+import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.ensureActive
+import kotlinx.coroutines.sync.Mutex
+import kotlinx.coroutines.sync.withLock
+import java.io.File
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.SharingStarted
 import kotlinx.coroutines.flow.StateFlow
@@ -108,7 +113,7 @@ class HomeViewModel @Inject constructor(
                 ) {
                     // Quantize progress to 1% steps so HomeScreen doesn't recompose 60 times/sec on sub-percent float updates
                     val quantizedProgress = ((info.progress * 100f).toInt().coerceIn(0, 100)) / 100f
-                    info.copy(progress = quantizedProgress)
+                    info.copy(progress = quantizedProgress, downloadedSize = 0L)
                 } else {
                     null
                 }
@@ -368,15 +373,6 @@ class HomeViewModel @Inject constructor(
 
     fun isPasswordSet() = masterPasswordService.isPasswordSet()
 
-    fun setAndUnlockMasterPassword(password: String) {
-        if (password.isNotBlank()) {
-            if (!masterPasswordService.isPasswordSet()) {
-                masterPasswordService.setPassword(password)
-            }
-            secureSessionManager.setSessionPassword(password)
-        }
-    }
-
     fun fetchItems(forceRefresh: Boolean = false) {
         viewModelScope.launch {
             val hasLocalItems = items.value.isNotEmpty()
@@ -414,50 +410,62 @@ class HomeViewModel @Inject constructor(
         fetchItems(forceRefresh = true)
     }
 
+    private val uploadSubmissionMutex = Mutex()
+
     fun uploadFile(
         filePath: String,
         fileName: String,
         encryptFile: Boolean = false,
         sendAsDirectMedia: Boolean = false
     ) {
-        viewModelScope.launch {
-            driveRepository.uploadFile(
-                filePath = filePath,
-                originalFileName = fileName,
-                chatId = _currentFolderId.value,
-                virtualFolderId = _currentVirtualFolderId.value,
-                encryptFile = encryptFile,
-                sendAsDirectMedia = sendAsDirectMedia
-            )
-        }
+        uploadBatch(listOf(File(filePath) to fileName), null, encryptFile, sendAsDirectMedia, null)
     }
 
-    fun uploadFileToDestination(
-        filePath: String,
-        fileName: String,
-        destination: MoveCopyDestination,
-        encryptFile: Boolean = false,
-        sendAsDirectMedia: Boolean = false
+    fun uploadBatch(
+        files: List<Pair<File, String>>,
+        destination: MoveCopyDestination?,
+        encryptFile: Boolean,
+        sendAsDirectMedia: Boolean,
+        newPassword: String?
     ) {
-        viewModelScope.launch {
-            val targetChatId = when {
-                destination.isRoot -> null
-                destination.isVirtual -> if (destination.targetChatId != 0L) destination.targetChatId else null
-                else -> if (destination.targetChatId != 0L) destination.targetChatId else null
+        val chatId = if (destination == null) _currentFolderId.value
+            else destination.targetChatId.takeUnless { destination.isRoot || it == 0L }
+        val virtualId = when {
+            destination == null -> _currentVirtualFolderId.value
+            destination.isVirtual && !destination.isRoot -> destination.targetVirtualId.ifBlank { "0" }
+            else -> "0"
+        }
+        val slot = activeSlotId.value
+        viewModelScope.launch(Dispatchers.IO) {
+            uploadSubmissionMutex.withLock {
+                if (activeSlotId.value != slot) return@withLock
+                if (!newPassword.isNullOrBlank() && !masterPasswordService.isPasswordSet()) {
+                    masterPasswordService.setPassword(newPassword)
+                    secureSessionManager.setSessionPassword(newPassword)
+                }
+                for ((file, name) in files) {
+                    ensureActive()
+                    if (activeSlotId.value != slot) break
+                    try {
+                        driveRepository.uploadFile(
+                            filePath = file.absolutePath,
+                            originalFileName = name,
+                            chatId = chatId,
+                            virtualFolderId = virtualId,
+                            encryptFile = encryptFile,
+                            sendAsDirectMedia = sendAsDirectMedia
+                        )
+                    } catch (error: CancellationException) {
+                        throw error
+                    } catch (error: Exception) {
+                        android.util.Log.e("HomeViewModel", "Could not queue upload", error)
+                        transferRepository.addTransfer(
+                            0, "upload_failed_" + System.nanoTime(), name, false,
+                            file.length(), status = TransferRepository.Status.FAILED
+                        )
+                    }
+                }
             }
-            val targetVirtualId = when {
-                destination.isRoot -> "0"
-                destination.isVirtual -> destination.targetVirtualId.ifBlank { "0" }
-                else -> "0"
-            }
-            driveRepository.uploadFile(
-                filePath = filePath,
-                originalFileName = fileName,
-                chatId = targetChatId,
-                virtualFolderId = targetVirtualId,
-                encryptFile = encryptFile,
-                sendAsDirectMedia = sendAsDirectMedia
-            )
         }
     }
 
