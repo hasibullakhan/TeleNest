@@ -165,7 +165,7 @@ fun NavGraph(navController: NavHostController) {
                 val activity = context as? FragmentActivity
 
                 NavigationBar(
-                    containerColor = MaterialTheme.colorScheme.surfaceContainerLow
+                    containerColor = MaterialTheme.colorScheme.surfaceContainer
                 ) {
                     bottomNavScreens.forEach { screen ->
                         val isHome = screen == Screen.Home
@@ -215,7 +215,9 @@ fun NavGraph(navController: NavHostController) {
                                                                     }
                                                                 },
                                                                 onError = { code, _ ->
-                                                                    if (code == BiometricPrompt.ERROR_NEGATIVE_BUTTON) {
+                                                                    if (code != BiometricPrompt.ERROR_CANCELED &&
+                                                                        code != BiometricPrompt.ERROR_USER_CANCELED
+                                                                    ) {
                                                                         showUnlockDialog = true
                                                                     }
                                                                 }

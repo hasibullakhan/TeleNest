@@ -17,6 +17,7 @@ import com.awd.teledrive.data.secure.SecureSettings
 import dagger.hilt.android.qualifiers.ApplicationContext
 import kotlinx.coroutines.CompletableDeferred
 import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.CoroutineStart
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.flow.MutableStateFlow
@@ -58,7 +59,7 @@ class TransferRepository @Inject constructor(
         val block: suspend () -> Unit
     )
 
-    private val queue = mutableListOf<PendingTransfer>()
+    private val queue = linkedMapOf<String, PendingTransfer>()
     private var activeTransferId: String? = null
     private val completionDeferreds = mutableMapOf<String, CompletableDeferred<Unit>>()
     private val idMigrationMap = mutableMapOf<String, String>()
@@ -427,36 +428,33 @@ class TransferRepository @Inject constructor(
         localPath: String? = null,
         block: suspend () -> Unit
     ) {
-        scope.launch {
+        scope.launch(start = CoroutineStart.UNDISPATCHED) {
             val key = if (remoteUniqueId.isNotEmpty()) remoteUniqueId else "temp_${System.currentTimeMillis()}_$fileId"
 
-            val isStartingNewBatch = synchronized(queue) {
-                if (activeTransferId == key || queue.any { it.remoteUniqueId == key }) return@launch
-                val wasIdle = activeTransferId == null && queue.isEmpty()
-                queue.add(PendingTransfer(key, isDownload, block))
-                wasIdle
-            }
-
             dbMutex.withLock {
-                if (isStartingNewBatch) {
-                    // Clear completed/cancelled/failed rows from earlier batches so the new batch count is 100% accurate
-                    transferDao.clearCompleted()
-                    if (!isDownload) {
-                        transferDao.clearStaleDownloads()
-                    }
+                val isStartingNewBatch = synchronized(queue) {
+                    if (activeTransferId == key || queue.containsKey(key)) return@launch
+                    activeTransferId == null && queue.isEmpty()
                 }
-                val entity = TransferEntity(
-                    remoteUniqueId = key,
-                    fileId = fileId,
-                    fileName = fileName,
-                    progress = 0f,
-                    isDownload = isDownload,
-                    status = Status.QUEUED,
-                    totalSize = totalSize,
-                    downloadedSize = 0L,
-                    localPath = localPath
+                if (isStartingNewBatch) {
+                    transferDao.clearCompleted()
+                    if (!isDownload) transferDao.clearStaleDownloads()
+                }
+                transferDao.insertTransfer(
+                    TransferEntity(
+                        remoteUniqueId = key,
+                        fileId = fileId,
+                        fileName = fileName,
+                        progress = 0f,
+                        isDownload = isDownload,
+                        status = Status.QUEUED,
+                        totalSize = totalSize,
+                        downloadedSize = 0L,
+                        localPath = localPath
+                    )
                 )
-                transferDao.insertTransfer(entity)
+                // The processor and Cancel actions can only see work with a persisted transfer row.
+                synchronized(queue) { queue[key] = PendingTransfer(key, isDownload, block) }
             }
 
             processQueue()
@@ -467,7 +465,9 @@ class TransferRepository @Inject constructor(
         synchronized(queue) {
             if (activeTransferId != null || queue.isEmpty()) return
 
-            val next = queue.removeAt(0)
+            val entries = queue.values.iterator()
+            val next = entries.next()
+            entries.remove()
             activeTransferId = next.remoteUniqueId
 
             scope.launch {
@@ -608,17 +608,11 @@ class TransferRepository @Inject constructor(
             _cancelAllEvents.tryEmit(Unit)
         }
         scope.launch {
-            var foundInQueue = false
-            synchronized(queue) {
-                val inQueue = queue.find { it.remoteUniqueId == uniqueId }
-                if (inQueue != null) {
-                    queue.remove(inQueue)
-                    foundInQueue = true
-                }
-                completionDeferreds[uniqueId]?.complete(Unit)
-            }
-
             dbMutex.withLock {
+                val foundInQueue = synchronized(queue) {
+                    completionDeferreds[uniqueId]?.complete(Unit)
+                    queue.remove(uniqueId) != null
+                }
                 if (foundInQueue) {
                     transferDao.updateProgress(uniqueId, 0f, Status.CANCELLED, 0L)
                     return@withLock

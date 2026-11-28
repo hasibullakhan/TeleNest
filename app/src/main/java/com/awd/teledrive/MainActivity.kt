@@ -64,6 +64,15 @@ import com.awd.teledrive.ui.screens.settings.SettingsViewModel
 import com.awd.teledrive.ui.theme.TeledriveTheme
 import com.awd.teledrive.ui.theme.ThemeViewModel
 import dagger.hilt.android.AndroidEntryPoint
+import kotlinx.coroutines.CancellationException
+import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.CoroutineStart
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.Job
+import kotlinx.coroutines.SupervisorJob
+import kotlinx.coroutines.ensureActive
+import kotlinx.coroutines.job
+import kotlinx.coroutines.withContext
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.launch
@@ -95,6 +104,8 @@ class MainActivity : AppCompatActivity() {
         private val _pendingSharedFiles = MutableStateFlow<List<Pair<java.io.File, String>>>(emptyList())
         val pendingSharedFiles = _pendingSharedFiles.asStateFlow()
 
+        private val sharedStagingScope = CoroutineScope(SupervisorJob() + Dispatchers.Main)
+        private var sharedStagingJob: Job? = null
         private val _isStagingSharedFiles = MutableStateFlow(false)
         val isStagingSharedFiles = _isStagingSharedFiles.asStateFlow()
 
@@ -111,7 +122,7 @@ class MainActivity : AppCompatActivity() {
         }
 
         fun cancelStagingSharedFiles() {
-            _isStagingSharedFiles.value = false
+            sharedStagingJob?.cancel()
         }
     }
 
@@ -156,7 +167,8 @@ class MainActivity : AppCompatActivity() {
         }
     }
 
-    private fun copyUriToTempFile(uri: Uri): Pair<java.io.File, String>? {
+    private fun copyUriToTempFile(uri: Uri, checkCancellation: () -> Unit): Pair<java.io.File, String>? {
+        var incompleteStage: java.io.File? = null
         return try {
             val resolver = applicationContext.contentResolver
             val queriedName = try {
@@ -186,17 +198,29 @@ class MainActivity : AppCompatActivity() {
             }
 
             val stageDir = java.io.File(applicationContext.cacheDir, "stage_${System.nanoTime()}").apply { mkdirs() }
-            val tempFile = java.io.File(stageDir, finalFileName)
+            incompleteStage = stageDir
+            val tempFile = java.io.File(stageDir, finalFileName.takeUnless { it == "." || it == ".." } ?: "File")
+
+            fun copy(input: java.io.InputStream) {
+                tempFile.outputStream().use { output ->
+                    val buffer = ByteArray(64 * 1024)
+                    while (true) {
+                        checkCancellation()
+                        val length = input.read(buffer)
+                        if (length < 0) break
+                        output.write(buffer, 0, length)
+                    }
+                }
+            }
 
             var copied = false
             try {
                 resolver.openInputStream(uri)?.use { input ->
-                    java.io.FileOutputStream(tempFile).use { output ->
-                        input.copyTo(output, bufferSize = 64 * 1024)
-                        output.flush()
-                    }
-                    copied = tempFile.exists() && tempFile.length() > 0L
+                    copy(input)
+                    copied = tempFile.isFile
                 }
+            } catch (error: CancellationException) {
+                throw error
             } catch (_: Exception) {
                 copied = false
             }
@@ -205,13 +229,12 @@ class MainActivity : AppCompatActivity() {
                 try {
                     resolver.openFileDescriptor(uri, "r")?.use { pfd ->
                         java.io.FileInputStream(pfd.fileDescriptor).use { input ->
-                            java.io.FileOutputStream(tempFile).use { output ->
-                                input.copyTo(output, bufferSize = 64 * 1024)
-                                output.flush()
-                            }
+                            copy(input)
                         }
-                        copied = tempFile.exists() && tempFile.length() > 0L
+                        copied = tempFile.isFile
                     }
+                } catch (error: CancellationException) {
+                    throw error
                 } catch (_: Exception) {
                     copied = false
                 }
@@ -222,21 +245,25 @@ class MainActivity : AppCompatActivity() {
                 if (!srcPath.isNullOrBlank()) {
                     val srcFile = java.io.File(srcPath)
                     if (srcFile.exists() && srcFile.canRead()) {
-                        srcFile.copyTo(tempFile, overwrite = true)
-                        copied = tempFile.exists() && tempFile.length() > 0L
+                        srcFile.inputStream().use { copy(it) }
+                        copied = tempFile.isFile
                     }
                 }
             }
 
             if (copied && tempFile.exists()) {
-                tempFile to finalFileName
+                incompleteStage = null
+                tempFile to tempFile.name
             } else {
-                try { tempFile.delete() } catch (_: Exception) {}
                 null
             }
-        } catch (e: Exception) {
-            e.printStackTrace()
+        } catch (error: CancellationException) {
+            throw error
+        } catch (error: Exception) {
+            android.util.Log.w("MainActivity", "Could not stage shared file", error)
             null
+        } finally {
+            incompleteStage?.deleteRecursively()
         }
     }
 
@@ -280,28 +307,43 @@ class MainActivity : AppCompatActivity() {
 
         if (collectedUris.isNotEmpty()) {
             val urisList = collectedUris.toList()
+            sharedStagingJob?.cancel()
             _isStagingSharedFiles.value = true
-            kotlinx.coroutines.CoroutineScope(kotlinx.coroutines.Dispatchers.IO + kotlinx.coroutines.SupervisorJob()).launch {
+            sharedStagingJob = sharedStagingScope.launch(start = CoroutineStart.LAZY) {
+                val staged = mutableListOf<Pair<java.io.File, String>>()
+                var delivered = false
                 try {
-                    val staged = urisList.mapNotNull { uri -> copyUriToTempFile(uri) }
-                    if (staged.isNotEmpty()) {
-                        _pendingSharedFiles.value = staged
-                    } else {
-                        kotlinx.coroutines.withContext(kotlinx.coroutines.Dispatchers.Main) {
-                            android.widget.Toast.makeText(
-                                applicationContext,
-                                "Unable to read shared file(s)",
-                                android.widget.Toast.LENGTH_SHORT
-                            ).show()
+                    withContext(Dispatchers.IO) {
+                        for (uri in urisList) {
+                            ensureActive()
+                            copyUriToTempFile(uri) { ensureActive() }?.let(staged::add)
                         }
                     }
+                    if (staged.size != urisList.size) {
+                        android.widget.Toast.makeText(
+                            applicationContext,
+                            getString(R.string.upload_unreadable_files, urisList.size - staged.size),
+                            android.widget.Toast.LENGTH_LONG
+                        ).show()
+                    }
+                    if (staged.isNotEmpty()) {
+                        _pendingSharedFiles.value = staged
+                        delivered = true
+                    }
                 } finally {
-                    _isStagingSharedFiles.value = false
-                    try {
-                        intent.removeExtra(Intent.EXTRA_STREAM)
-                    } catch (_: Exception) {}
+                    if (sharedStagingJob == coroutineContext.job) {
+                        _isStagingSharedFiles.value = false
+                        sharedStagingJob = null
+                    }
+                    intent.removeExtra(Intent.EXTRA_STREAM)
+                    if (!delivered) {
+                        withContext(kotlinx.coroutines.NonCancellable + Dispatchers.IO) {
+                            staged.forEach { (file, _) -> file.parentFile?.deleteRecursively() }
+                        }
+                    }
                 }
             }
+            sharedStagingJob?.start()
         }
     }
 

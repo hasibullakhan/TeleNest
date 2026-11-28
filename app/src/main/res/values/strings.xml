@@ -395,4 +395,14 @@
     <string name="search_country_hint">Search country or code (A–Z)...</string>
     <string name="country_code_label">Code</string>
     <string name="phone_local_placeholder">1712345678</string>
+    <string name="upload_preparing_count">%1$d of %2$d files prepared</string>
+    <string name="upload_unreadable_files">Could not read %1$d selected file(s).</string>
+    <string name="transfer_uploads">Uploads</string>
+    <string name="transfer_downloads">Downloads</string>
+    <string name="transfer_empty">No transfers here yet</string>
+    <string name="transfer_clear_finished">Clear finished transfers</string>
+    <string name="transfer_go_back">Go back</string>
+    <string name="transfer_cancelled">Cancelled</string>
+    <string name="save_file_error">Could not save file to Downloads.</string>
+    <string name="drive_storage_used">%1$s stored</string>
 </resources>

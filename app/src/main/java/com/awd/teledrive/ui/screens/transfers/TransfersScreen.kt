@@ -13,7 +13,6 @@ import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
-import androidx.compose.foundation.layout.statusBarsPadding
 import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
@@ -30,6 +29,7 @@ import androidx.compose.material.icons.filled.Upload
 import androidx.compose.material3.Card
 import androidx.compose.material3.CardDefaults
 import androidx.compose.material3.ExperimentalMaterial3Api
+import androidx.compose.material3.FilterChip
 import androidx.compose.material3.Icon
 import androidx.compose.material3.IconButton
 import androidx.compose.material3.LinearProgressIndicator
@@ -41,6 +41,10 @@ import androidx.compose.material3.TopAppBar
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.collectAsState
 import androidx.compose.runtime.getValue
+import androidx.compose.runtime.mutableStateOf
+import androidx.compose.runtime.remember
+import androidx.compose.runtime.saveable.rememberSaveable
+import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
@@ -51,6 +55,7 @@ import androidx.compose.ui.unit.dp
 import androidx.hilt.lifecycle.viewmodel.compose.hiltViewModel
 import com.awd.teledrive.R
 import com.awd.teledrive.data.model.TransferInfo
+import com.awd.teledrive.data.repository.TransferRepository
 import com.awd.teledrive.ui.theme.TeledriveTheme
 import kotlin.math.log10
 import kotlin.math.pow
@@ -81,64 +86,99 @@ fun TransfersContent(
     onRemoveTransfer: (String) -> Unit,
     onClearCompleted: () -> Unit
 ) {
+    var filter by rememberSaveable { mutableStateOf(TransferFilter.ALL) }
+    val visibleTransfers = remember(transfers, filter) {
+        when (filter) {
+            TransferFilter.ALL -> transfers
+            TransferFilter.UPLOADS -> transfers.filterNot { it.isDownload }
+            TransferFilter.DOWNLOADS -> transfers.filter { it.isDownload }
+        }
+    }
+    val hasFinished = remember(transfers) { transfers.any { it.isFinished() } }
+
     Scaffold(
         topBar = {
             TopAppBar(
-                title = { Text(stringResource(R.string.transfers)) },
-                modifier = Modifier.statusBarsPadding(),
+                title = { Text(stringResource(R.string.transfers), style = MaterialTheme.typography.headlineSmall) },
                 navigationIcon = {
                     IconButton(onClick = onBack) {
-                        Icon(Icons.AutoMirrored.Filled.ArrowBack, contentDescription = stringResource(R.string.cancel))
+                        Icon(Icons.AutoMirrored.Filled.ArrowBack, contentDescription = stringResource(R.string.transfer_go_back))
                     }
                 },
                 actions = {
-                    IconButton(onClick = onClearCompleted) {
-                        Icon(Icons.Default.DeleteSweep, contentDescription = stringResource(R.string.clear_selection))
+                    IconButton(onClick = onClearCompleted, enabled = hasFinished) {
+                        Icon(Icons.Default.DeleteSweep, contentDescription = stringResource(R.string.transfer_clear_finished))
                     }
                 }
             )
         }
     ) { padding ->
-        if (transfers.isEmpty()) {
-            Column(
-                modifier = Modifier.fillMaxSize().padding(padding),
-                horizontalAlignment = Alignment.CenterHorizontally,
-                verticalArrangement = Arrangement.Center
+        Column(Modifier.fillMaxSize().padding(padding)) {
+            androidx.compose.foundation.lazy.LazyRow(
+                contentPadding = PaddingValues(horizontal = 16.dp, vertical = 4.dp),
+                horizontalArrangement = Arrangement.spacedBy(8.dp)
             ) {
-                Icon(
-                    Icons.Default.SwapVert,
-                    contentDescription = null,
-                    modifier = Modifier.size(56.dp),
-                    tint = MaterialTheme.colorScheme.outline
-                )
-                Spacer(modifier = Modifier.height(12.dp))
-                Text(
-                    stringResource(R.string.no_results),
-                    style = MaterialTheme.typography.bodyLarge,
-                    color = MaterialTheme.colorScheme.onSurfaceVariant
-                )
-            }
-        } else {
-            LazyColumn(
-                modifier = Modifier.fillMaxSize().padding(padding),
-                contentPadding = PaddingValues(horizontal = 16.dp, vertical = 12.dp),
-                verticalArrangement = Arrangement.spacedBy(10.dp)
-            ) {
-                items(
-                    items = transfers,
-                    key = { it.remoteUniqueId },
-                    contentType = { "transfer" }
-                ) { transfer ->
-                    TransferCard(
-                        transfer = transfer,
-                        onCancel = onCancelTransfer,
-                        onRemove = onRemoveTransfer,
-                        modifier = Modifier.animateItem()
+                items(TransferFilter.entries, key = { it.name }) { option ->
+                    FilterChip(
+                        selected = filter == option,
+                        onClick = { filter = option },
+                        label = { Text(stringResource(option.label)) }
                     )
+                }
+            }
+
+            if (visibleTransfers.isEmpty()) {
+                Column(
+                    modifier = Modifier.fillMaxSize().padding(24.dp),
+                    horizontalAlignment = Alignment.CenterHorizontally,
+                    verticalArrangement = Arrangement.Center
+                ) {
+                    Surface(
+                        shape = RoundedCornerShape(24.dp),
+                        color = MaterialTheme.colorScheme.primaryContainer
+                    ) {
+                        Icon(
+                            Icons.Default.SwapVert,
+                            contentDescription = null,
+                            modifier = Modifier.padding(18.dp).size(32.dp),
+                            tint = MaterialTheme.colorScheme.onPrimaryContainer
+                        )
+                    }
+                    Spacer(modifier = Modifier.height(16.dp))
+                    Text(stringResource(R.string.transfer_empty), style = MaterialTheme.typography.titleMedium)
+                }
+            } else {
+                LazyColumn(
+                    modifier = Modifier.fillMaxSize(),
+                    contentPadding = PaddingValues(horizontal = 16.dp, vertical = 12.dp),
+                    verticalArrangement = Arrangement.spacedBy(8.dp)
+                ) {
+                    items(visibleTransfers, key = { it.remoteUniqueId }, contentType = { "transfer" }) { transfer ->
+                        TransferCard(
+                            transfer = transfer,
+                            onCancel = onCancelTransfer,
+                            onRemove = onRemoveTransfer,
+                            modifier = Modifier.animateItem()
+                        )
+                    }
                 }
             }
         }
     }
+}
+
+private enum class TransferFilter(val label: Int) {
+    ALL(R.string.filter_all),
+    UPLOADS(R.string.transfer_uploads),
+    DOWNLOADS(R.string.transfer_downloads)
+}
+
+private fun TransferInfo.isFailed(): Boolean =
+    status.startsWith(TransferRepository.Status.FAILED) || status.startsWith("Gagal")
+
+private fun TransferInfo.isFinished(): Boolean = when (status) {
+    TransferRepository.Status.COMPLETED, TransferRepository.Status.CANCELLED, "Selesai", "Dibatalkan" -> true
+    else -> isFailed()
 }
 
 @Composable
@@ -148,11 +188,9 @@ private fun TransferCard(
     onRemove: (String) -> Unit,
     modifier: Modifier = Modifier
 ) {
-    val status = com.awd.teledrive.data.repository.TransferRepository.Status
-    val isFailed = transfer.status.startsWith(status.FAILED)
-    val isTerminal = transfer.status == status.COMPLETED ||
-        transfer.status == status.CANCELLED ||
-        isFailed
+    val status = TransferRepository.Status
+    val isFailed = transfer.isFailed()
+    val isTerminal = transfer.isFinished()
 
     val animatedProgress by animateFloatAsState(
         targetValue = transfer.progress.coerceIn(0f, 1f),
@@ -170,9 +208,12 @@ private fun TransferCard(
         status.DOWNLOADING -> stringResource(R.string.downloading_file, "")
         status.UPLOADING -> stringResource(R.string.uploading_file, "")
         status.COMPLETED -> stringResource(R.string.completed)
-        status.CANCELLED -> stringResource(R.string.cancel)
+        status.CANCELLED, "Dibatalkan" -> stringResource(R.string.transfer_cancelled)
         else -> transfer.status
     }
+
+    val details = if (isTerminal) "$statusText · $sizeText"
+        else "$statusText · $sizeText · ${(transfer.progress.coerceIn(0f, 1f) * 100).toInt()}%"
 
     Card(
         modifier = modifier.fillMaxWidth(),
@@ -205,7 +246,7 @@ private fun TransferCard(
                     overflow = TextOverflow.Ellipsis
                 )
                 Text(
-                    "$statusText - $sizeText (${(transfer.progress * 100).toInt()}%)",
+                    details,
                     style = MaterialTheme.typography.bodySmall,
                     color = if (isFailed) MaterialTheme.colorScheme.error else MaterialTheme.colorScheme.onSurfaceVariant,
                     maxLines = 2,

@@ -102,6 +102,7 @@ import androidx.compose.material.icons.filled.SearchOff
 import androidx.compose.material.icons.filled.Settings
 import androidx.compose.material.icons.filled.Share
 import androidx.compose.material.icons.filled.Star
+import androidx.compose.material.icons.filled.Storage
 import androidx.compose.material.icons.filled.SwapVert
 import androidx.compose.material.icons.filled.ArrowUpward
 import androidx.compose.material.icons.filled.ArrowDownward
@@ -156,6 +157,7 @@ import androidx.compose.material3.rememberModalBottomSheetState
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.collectAsState
+import androidx.compose.runtime.derivedStateOf
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
@@ -168,7 +170,6 @@ import androidx.compose.ui.draw.clip
 import androidx.compose.ui.geometry.CornerRadius
 import androidx.compose.ui.geometry.Offset
 import androidx.compose.ui.geometry.Size
-import androidx.compose.ui.graphics.Brush
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.Path
 import androidx.compose.ui.graphics.drawscope.Stroke
@@ -200,6 +201,9 @@ import com.awd.teledrive.domain.model.MoveCopyDestination
 import com.awd.teledrive.ui.screens.auth.TeleNestWelcomeSplashScreen
 import com.awd.teledrive.ui.theme.TeledriveTheme
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.Job
+import kotlinx.coroutines.ensureActive
+import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
@@ -226,7 +230,6 @@ fun HomeScreen(
     val items by viewModel.items.collectAsState()
     val allFolders by viewModel.allFolders.collectAsState()
     val suggestedFiles by viewModel.suggestedFiles.collectAsState()
-    val activeTransfers by viewModel.activeTransfers.collectAsState()
     val totalStorageUsed by viewModel.totalStorageUsed.collectAsState()
     val userProfile by viewModel.userProfile.collectAsState()
     val searchQuery by viewModel.searchQuery.collectAsState()
@@ -257,7 +260,7 @@ fun HomeScreen(
         items = items,
         allFolders = allFolders,
         suggestedFiles = suggestedFiles,
-        activeTransfers = activeTransfers,
+        activeTransfers = viewModel.activeTransfers,
         totalStorageUsed = totalStorageUsed,
         userProfile = userProfile,
         searchQuery = searchQuery,
@@ -292,9 +295,8 @@ fun HomeScreen(
         onCreateFolder = viewModel::createFolder,
         onCreateFolderForPicker = viewModel::createFolderForPicker,
         isPasswordSet = viewModel.isPasswordSet(),
-        onSetMasterPassword = viewModel::setAndUnlockMasterPassword,
         onUploadFile = viewModel::uploadFile,
-        onUploadFileToDestination = viewModel::uploadFileToDestination,
+        onUploadBatch = viewModel::uploadBatch,
         onDeleteItems = viewModel::deleteItems,
         onPermanentlyDeleteItems = viewModel::permanentlyDeleteItems,
         onRestoreItems = viewModel::restoreItemsFromTrash,
@@ -326,7 +328,7 @@ fun HomeContent(
     items: List<DriveItem>,
     allFolders: List<DriveItem.Folder> = emptyList(),
     suggestedFiles: List<DriveItem.File> = emptyList(),
-    activeTransfers: List<TransferInfo> = emptyList(),
+    activeTransfers: StateFlow<List<TransferInfo>>? = null,
     totalStorageUsed: Long,
     userProfile: TelegramUserProfile? = null,
     searchQuery: String,
@@ -361,9 +363,11 @@ fun HomeContent(
     onCreateFolder: (String, Boolean, Boolean) -> Unit,
     onCreateFolderForPicker: (String, Boolean, String, (MoveCopyDestination?) -> Unit) -> Unit = { _, _, _, cb -> cb(null) },
     isPasswordSet: Boolean,
-    onSetMasterPassword: (String) -> Unit = {},
     onUploadFile: (String, String, Boolean, Boolean) -> Unit,
-    onUploadFileToDestination: (String, String, MoveCopyDestination, Boolean, Boolean) -> Unit = { path, name, _, enc, dm -> onUploadFile(path, name, enc, dm) },
+    onUploadBatch: (List<Pair<File, String>>, MoveCopyDestination?, Boolean, Boolean, String?) -> Unit =
+        { files, _, encrypt, direct, _ ->
+            files.forEach { (file, name) -> onUploadFile(file.absolutePath, name, encrypt, direct) }
+        },
     onDeleteItems: (List<DriveItem>) -> Unit,
     onPermanentlyDeleteItems: (List<DriveItem>) -> Unit = {},
     onRestoreItems: (List<DriveItem>) -> Unit = {},
@@ -457,8 +461,92 @@ fun HomeContent(
     var encryptBeforeUpload by remember { mutableStateOf(false) }
     var sendAsDirectMedia by remember { mutableStateOf(false) }
     var inlineMasterPassword by remember { mutableStateOf("") }
-    var hasMasterPasswordSet by remember(isPasswordSet) { mutableStateOf(isPasswordSet) }
-    var isPreparingFile by remember { mutableStateOf(false) }
+    var preparationJob by remember { mutableStateOf<Job?>(null) }
+    var preparationProgress by remember { mutableStateOf<Pair<Int, Int>?>(null) }
+    val transferState = activeTransfers?.collectAsState()
+    val activeTransferCount by remember(transferState) { derivedStateOf { transferState?.value?.size ?: 0 } }
+
+    fun preparePickedFiles(uris: List<android.net.Uri>, encrypt: Boolean, shared: Boolean = false) {
+        if (uris.isEmpty() || preparationJob?.isActive == true) return
+        preparationProgress = 0 to uris.size
+        preparationJob = scope.launch {
+            val prepared = mutableListOf<Pair<File, String>>()
+            var handedOff = false
+            try {
+                withContext(Dispatchers.IO) {
+                    val buffer = ByteArray(64 * 1024)
+                    uris.forEachIndexed { index, uri ->
+                        ensureActive()
+                        var partialStage: File? = null
+                        try {
+                            val stageDir = File.createTempFile("stage_", ".tmp", context.cacheDir)
+                            partialStage = stageDir
+                            val name = File(FileUtils.resolveUriFileName(context, uri)).name
+                                .takeUnless { it.isBlank() || it == "." || it == ".." } ?: "File"
+                            check(stageDir.delete() && stageDir.mkdir())
+                            val file = File(stageDir, name)
+                            val input = context.contentResolver.openInputStream(uri)
+                                ?: throw java.io.IOException("File could not be opened")
+                            input.use {
+                                file.outputStream().use { output ->
+                                    while (true) {
+                                        ensureActive()
+                                        val count = input.read(buffer)
+                                        if (count < 0) break
+                                        output.write(buffer, 0, count)
+                                    }
+                                }
+                            }
+                            prepared.add(file to name)
+                        } catch (error: kotlinx.coroutines.CancellationException) {
+                            partialStage?.deleteRecursively()
+                            throw error
+                        } catch (_: Exception) {
+                            partialStage?.deleteRecursively()
+                        }
+                        if (index == uris.lastIndex || (index + 1) % 8 == 0) {
+                            withContext(Dispatchers.Main) { preparationProgress = index + 1 to uris.size }
+                        }
+                    }
+                }
+                if (prepared.size != uris.size) {
+                    Toast.makeText(
+                        context,
+                        context.getString(R.string.upload_unreadable_files, uris.size - prepared.size),
+                        Toast.LENGTH_LONG
+                    ).show()
+                }
+                if (prepared.isNotEmpty()) {
+                    encryptBeforeUpload = encrypt
+                    sendAsDirectMedia = false
+                    inlineMasterPassword = ""
+                    uploadTargetDestination = null
+                    pendingUploadFiles = prepared
+                    showUploadDestinationPicker = shared
+                    handedOff = true
+                }
+            } finally {
+                preparationProgress = null
+                if (!handedOff) {
+                    withContext(kotlinx.coroutines.NonCancellable + Dispatchers.IO) {
+                        prepared.forEach { (file, _) -> file.parentFile?.deleteRecursively() }
+                    }
+                }
+            }
+        }
+    }
+
+    fun dismissPendingUploads() {
+        val files = pendingUploadFiles
+        pendingUploadFiles = emptyList()
+        uploadTargetDestination = null
+        scope.launch(Dispatchers.IO) {
+            files.forEach { (file, _) ->
+                file.delete()
+                file.parentFile?.takeIf { it.name.startsWith("stage_") }?.delete()
+            }
+        }
+    }
     var newFolderName by remember { mutableStateOf("") }
     var isVirtualFolder by remember { mutableStateOf(true) }
     var isSecureFolder by remember { mutableStateOf(false) }
@@ -485,138 +573,36 @@ fun HomeContent(
         }
     }
 
-    LaunchedEffect(pendingSharedUris) {
-        if (pendingSharedUris.isNotEmpty()) {
-            val urisToProcess = pendingSharedUris.toList()
+    LaunchedEffect(pendingSharedUris, preparationProgress == null) {
+        if (pendingSharedUris.isNotEmpty() && preparationProgress == null) {
             onClearPendingSharedUris()
-            isPreparingFile = true
-            try {
-                val preparedFiles = withContext(Dispatchers.IO) {
-                    urisToProcess.mapNotNull { uri ->
-                        try {
-                            val fileName = FileUtils.resolveUriFileName(context, uri)
-                            val inputStream = context.contentResolver.openInputStream(uri)
-                            val stageDir = File(context.cacheDir, "stage_${System.nanoTime()}").apply { mkdirs() }
-                            val tempFile = File(stageDir, fileName)
-                            inputStream?.use { input ->
-                                FileOutputStream(tempFile).use { output ->
-                                    input.copyTo(output)
-                                }
-                            }
-                            if (tempFile.exists() && tempFile.length() > 0L) tempFile to fileName else null
-                        } catch (e: Exception) {
-                            null
-                        }
-                    }
-                }
-                if (preparedFiles.isNotEmpty()) {
-                    encryptBeforeUpload = false
-                    sendAsDirectMedia = false
-                    inlineMasterPassword = ""
-                    uploadTargetDestination = MoveCopyDestination(
-                        label = currentFolderName ?: context.getString(R.string.my_drive),
-                        isRoot = currentFolderId == null && currentVirtualFolderId == "0",
-                        isVirtual = currentVirtualFolderId != "0",
-                        targetChatId = currentFolderId ?: 0L,
-                        targetVirtualId = currentVirtualFolderId
-                    )
-                    pendingUploadFiles = preparedFiles
-                    showUploadDestinationPicker = true
-                } else {
-                    Toast.makeText(context, "Unable to read shared file(s)", Toast.LENGTH_SHORT).show()
-                }
-            } finally {
-                isPreparingFile = false
-            }
+            preparePickedFiles(pendingSharedUris, encrypt = false, shared = true)
         }
     }
 
     val visualMediaPickerLauncher = rememberLauncherForActivityResult(
         contract = ActivityResultContracts.PickMultipleVisualMedia()
     ) { uris ->
-        if (uris.isEmpty()) return@rememberLauncherForActivityResult
-        
-        scope.launch {
-            isPreparingFile = true
-            try {
-                val preparedFiles = withContext(Dispatchers.IO) {
-                    uris.mapNotNull { uri ->
-                        try {
-                            val fileName = FileUtils.resolveUriFileName(context, uri)
-                            val inputStream = context.contentResolver.openInputStream(uri)
-                            val stageDir = File(context.cacheDir, "stage_${System.nanoTime()}").apply { mkdirs() }
-                            val tempFile = File(stageDir, fileName)
-                            inputStream?.use { input ->
-                                FileOutputStream(tempFile).use { output ->
-                                    input.copyTo(output)
-                                }
-                            }
-                            if (tempFile.exists() && tempFile.length() > 0L) tempFile to fileName else null
-                        } catch (e: Exception) {
-                            null
-                        }
-                    }
-                }
-                if (preparedFiles.isNotEmpty()) {
-                    encryptBeforeUpload = nextPickerDefaultEncrypt
-                    nextPickerDefaultEncrypt = false
-                    sendAsDirectMedia = false
-                    inlineMasterPassword = ""
-                    uploadTargetDestination = null
-                    pendingUploadFiles = preparedFiles
-                }
-            } finally {
-                isPreparingFile = false
-            }
-        }
+        val encrypt = nextPickerDefaultEncrypt
+        nextPickerDefaultEncrypt = false
+        preparePickedFiles(uris, encrypt)
     }
 
     val multiFilePickerLauncher = rememberLauncherForActivityResult(
         contract = ActivityResultContracts.GetMultipleContents()
     ) { uris ->
-        if (uris.isEmpty()) return@rememberLauncherForActivityResult
-        
-        scope.launch {
-            isPreparingFile = true
-            try {
-                val preparedFiles = withContext(Dispatchers.IO) {
-                    uris.mapNotNull { uri ->
-                        try {
-                            val fileName = FileUtils.resolveUriFileName(context, uri)
-                            val inputStream = context.contentResolver.openInputStream(uri)
-                            val stageDir = File(context.cacheDir, "stage_${System.nanoTime()}").apply { mkdirs() }
-                            val tempFile = File(stageDir, fileName)
-                            inputStream?.use { input ->
-                                FileOutputStream(tempFile).use { output ->
-                                    input.copyTo(output)
-                                }
-                            }
-                            if (tempFile.exists() && tempFile.length() > 0L) tempFile to fileName else null
-                        } catch (e: Exception) {
-                            null
-                        }
-                    }
-                }
-                if (preparedFiles.isNotEmpty()) {
-                    encryptBeforeUpload = nextPickerDefaultEncrypt
-                    nextPickerDefaultEncrypt = false
-                    sendAsDirectMedia = false
-                    inlineMasterPassword = ""
-                    uploadTargetDestination = null
-                    pendingUploadFiles = preparedFiles
-                }
-            } finally {
-                isPreparingFile = false
-            }
-        }
+        val encrypt = nextPickerDefaultEncrypt
+        nextPickerDefaultEncrypt = false
+        preparePickedFiles(uris, encrypt)
     }
 
     val cameraLauncher = rememberLauncherForActivityResult(
         contract = ActivityResultContracts.TakePicturePreview()
     ) { bitmap ->
         bitmap?.let {
-            scope.launch {
-                isPreparingFile = true
+            if (preparationJob?.isActive == true) return@let
+            preparationProgress = 0 to 1
+            preparationJob = scope.launch {
                 try {
                     val preparedPhoto = withContext(Dispatchers.IO) {
                         val fileName = "IMG_${System.currentTimeMillis()}.jpg"
@@ -632,8 +618,12 @@ fun HomeContent(
                     inlineMasterPassword = ""
                     uploadTargetDestination = null
                     pendingUploadFiles = listOf(preparedPhoto)
+                } catch (error: kotlinx.coroutines.CancellationException) {
+                    throw error
+                } catch (_: Exception) {
+                    Toast.makeText(context, context.getString(R.string.upload_unreadable_files, 1), Toast.LENGTH_LONG).show()
                 } finally {
-                    isPreparingFile = false
+                    preparationProgress = null
                 }
             }
         }
@@ -921,17 +911,18 @@ fun HomeContent(
     }
 
     if (pendingUploadFiles.isNotEmpty() && !showUploadDestinationPicker) {
-        val totalBytes = remember(pendingUploadFiles) { pendingUploadFiles.sumOf { it.first.length() } }
-        val needsNewPassword = encryptBeforeUpload && !hasMasterPasswordSet
+        val fileSizes by androidx.compose.runtime.produceState(emptyList<Long>(), pendingUploadFiles) {
+            value = withContext(Dispatchers.IO) { pendingUploadFiles.map { it.first.length() } }
+        }
+        val totalBytes = remember(fileSizes) { fileSizes.sum() }
+        val needsNewPassword = encryptBeforeUpload && !isPasswordSet
         val activeDestLabel = uploadTargetDestination?.label
             ?: currentFolderName
             ?: stringResource(R.string.my_drive)
 
         AlertDialog(
             onDismissRequest = {
-                pendingUploadFiles.forEach { (file, _) -> try { file.delete() } catch (_: Exception) {} }
-                pendingUploadFiles = emptyList()
-                uploadTargetDestination = null
+                dismissPendingUploads()
             },
             icon = {
                 Icon(
@@ -955,7 +946,7 @@ fun HomeContent(
                         modifier = Modifier.fillMaxWidth()
                     ) {
                         Column(modifier = Modifier.padding(12.dp), verticalArrangement = Arrangement.spacedBy(4.dp)) {
-                            pendingUploadFiles.take(3).forEach { (file, name) ->
+                            pendingUploadFiles.take(3).forEachIndexed { index, (_, name) ->
                                 Row(
                                     modifier = Modifier.fillMaxWidth(),
                                     horizontalArrangement = Arrangement.SpaceBetween,
@@ -970,7 +961,7 @@ fun HomeContent(
                                     )
                                     Spacer(Modifier.width(8.dp))
                                     Text(
-                                        text = formatSize(file.length()),
+                                        text = fileSizes.getOrNull(index)?.let(::formatSize).orEmpty(),
                                         style = MaterialTheme.typography.labelSmall,
                                         color = MaterialTheme.colorScheme.onSurfaceVariant
                                     )
@@ -1158,23 +1149,12 @@ fun HomeContent(
                 Button(
                     enabled = !needsNewPassword || inlineMasterPassword.length >= 4,
                     onClick = {
-                        if (needsNewPassword && inlineMasterPassword.isNotBlank()) {
-                            onSetMasterPassword(inlineMasterPassword)
-                            hasMasterPasswordSet = true
-                        }
+                        val newPassword = inlineMasterPassword.takeIf { needsNewPassword }
                         val filesToProcess = pendingUploadFiles
-                        val shouldEncrypt = encryptBeforeUpload
-                        val directMedia = sendAsDirectMedia
-                        val customDest = uploadTargetDestination
                         pendingUploadFiles = emptyList()
+                        onUploadBatch(filesToProcess, uploadTargetDestination, encryptBeforeUpload, sendAsDirectMedia, newPassword)
                         uploadTargetDestination = null
-                        filesToProcess.forEach { (file, name) ->
-                            if (customDest != null) {
-                                onUploadFileToDestination(file.absolutePath, name, customDest, shouldEncrypt, directMedia)
-                            } else {
-                                onUploadFile(file.absolutePath, name, shouldEncrypt, directMedia)
-                            }
-                        }
+                        inlineMasterPassword = ""
                         Toast.makeText(
                             context,
                             "Uploading ${filesToProcess.size} file(s) to $activeDestLabel",
@@ -1189,9 +1169,7 @@ fun HomeContent(
             dismissButton = {
                 TextButton(
                     onClick = {
-                        pendingUploadFiles.forEach { (file, _) -> try { file.delete() } catch (_: Exception) {} }
-                        pendingUploadFiles = emptyList()
-                        uploadTargetDestination = null
+                        dismissPendingUploads()
                     }
                 ) {
                     Text(stringResource(R.string.cancel))
@@ -1219,10 +1197,28 @@ fun HomeContent(
         )
     }
 
-    if (isPreparingFile || isStagingSharedFiles) {
+    preparationProgress?.let { (prepared, total) ->
+        AlertDialog(
+            onDismissRequest = { preparationJob?.cancel() },
+            title = { Text(stringResource(R.string.preparing_file)) },
+            text = {
+                Column(verticalArrangement = Arrangement.spacedBy(12.dp)) {
+                    Text(stringResource(R.string.upload_preparing_count, prepared, total))
+                    LinearProgressIndicator(
+                        progress = { prepared.toFloat() / total },
+                        modifier = Modifier.fillMaxWidth()
+                    )
+                }
+            },
+            confirmButton = {
+                TextButton(onClick = { preparationJob?.cancel() }) { Text(stringResource(R.string.cancel)) }
+            }
+        )
+    }
+
+    if (isStagingSharedFiles && preparationProgress == null) {
         AlertDialog(
             onDismissRequest = {
-                isPreparingFile = false
                 onCancelStagingSharedFiles()
             },
             title = { Text(stringResource(R.string.preparing_file)) },
@@ -1236,10 +1232,7 @@ fun HomeContent(
             confirmButton = {},
             dismissButton = {
                 TextButton(
-                    onClick = {
-                        isPreparingFile = false
-                        onCancelStagingSharedFiles()
-                    }
+                    onClick = onCancelStagingSharedFiles
                 ) {
                     Text(stringResource(R.string.cancel))
                 }
@@ -1694,12 +1687,12 @@ fun HomeContent(
                         icon = {
                             BadgedBox(
                                 badge = {
-                                    if (activeTransfers.isNotEmpty()) {
+                                    if (activeTransferCount > 0) {
                                         Badge(
                                             containerColor = MaterialTheme.colorScheme.primary,
                                             contentColor = MaterialTheme.colorScheme.onPrimary
                                         ) {
-                                            Text(activeTransfers.size.toString())
+                                            Text(activeTransferCount.toString())
                                         }
                                     }
                                 }
@@ -1721,9 +1714,9 @@ fun HomeContent(
                                     style = MaterialTheme.typography.bodyLarge,
                                     fontWeight = FontWeight.Medium
                                 )
-                                if (activeTransfers.isNotEmpty()) {
+                                if (activeTransferCount > 0) {
                                     Text(
-                                        text = "${activeTransfers.size} active",
+                                        text = "${activeTransferCount} active",
                                         style = MaterialTheme.typography.labelSmall,
                                         color = MaterialTheme.colorScheme.primary
                                     )
@@ -2234,8 +2227,8 @@ fun HomeContent(
 
                                 // Compact Pill Search Bar in the middle
                                 Surface(
-                                    color = MaterialTheme.colorScheme.surfaceVariant.copy(alpha = 0.55f),
-                                    shape = RoundedCornerShape(28.dp),
+                                    color = MaterialTheme.colorScheme.surfaceContainerHigh,
+                                    shape = RoundedCornerShape(18.dp),
                                     modifier = Modifier
                                         .weight(1f)
                                         .height(50.dp)
@@ -2269,7 +2262,7 @@ fun HomeContent(
                                                 )
                                             }
                                         } else {
-                                            IconButton(onClick = { isSearchActive = false }) {
+                                            IconButton(onClick = { onSearchQueryChange(""); isSearchActive = false }) {
                                                 Icon(Icons.AutoMirrored.Filled.ArrowBack, contentDescription = null)
                                             }
                                             Spacer(modifier = Modifier.width(8.dp))
@@ -2293,27 +2286,16 @@ fun HomeContent(
                                     }
                                 }
 
-                                // Right Telegram Profile Avatar (Google Drive-style ring + user avatar)
+                                // Telegram profile
                                 if (!isSearchActive) {
                                     val avatarFile = remember(userProfile?.avatarPath) {
                                         userProfile?.avatarPath?.let { File(it) }?.takeIf { it.exists() }
-                                    }
-                                    val ringBrush = remember {
-                                        Brush.sweepGradient(
-                                            listOf(
-                                                Color(0xFF4285F4),
-                                                Color(0xFF34A853),
-                                                Color(0xFFFBBC05),
-                                                Color(0xFFEA4335),
-                                                Color(0xFF4285F4)
-                                            )
-                                        )
                                     }
                                     Box(
                                         modifier = Modifier
                                             .size(42.dp)
                                             .clip(CircleShape)
-                                            .border(BorderStroke(2.dp, ringBrush), CircleShape)
+                                            .border(1.dp, MaterialTheme.colorScheme.outlineVariant, CircleShape)
                                             .padding(3.dp)
                                             .clip(CircleShape)
                                             .background(MaterialTheme.colorScheme.primaryContainer)
@@ -2348,8 +2330,12 @@ fun HomeContent(
                             }
 
                             if (!isSearchActive) {
-                                Spacer(modifier = Modifier.height(10.dp))
-
+                                if (currentSection == HomeSection.HOME) {
+                                    DriveOverview(
+                                        storageUsed = totalStorageUsed,
+                                        onOpenStorage = onNavigateToCloudAnalysis
+                                    )
+                                }
                                 FilterSortRow(
                                     filterType = filterType,
                                     sortOrder = sortOrder,
@@ -2443,82 +2429,7 @@ fun HomeContent(
                         }
                     }
 
-                    // Live Google Drive Transfer Progress Banner (when uploads/downloads are running)
-                    AnimatedVisibility(
-                        visible = activeTransfers.isNotEmpty(),
-                        enter = fadeIn() + slideInVertically(),
-                        exit = fadeOut() + slideOutVertically()
-                    ) {
-                        val primaryTransfer = activeTransfers.firstOrNull()
-                        if (primaryTransfer != null) {
-                            val pct = (primaryTransfer.progress * 100).toInt().coerceIn(0, 100)
-                            Surface(
-                                color = MaterialTheme.colorScheme.secondaryContainer.copy(alpha = 0.85f),
-                                shape = RoundedCornerShape(14.dp),
-                                modifier = Modifier
-                                    .fillMaxWidth()
-                                    .padding(horizontal = 16.dp, vertical = 4.dp)
-                                    .clickable { onNavigateToTransfers() }
-                            ) {
-                                Column(modifier = Modifier.padding(horizontal = 14.dp, vertical = 10.dp)) {
-                                    Row(
-                                        verticalAlignment = Alignment.CenterVertically,
-                                        modifier = Modifier.fillMaxWidth()
-                                    ) {
-                                        Icon(
-                                            imageVector = if (primaryTransfer.isDownload) Icons.Default.Download else Icons.Default.CloudUpload,
-                                            contentDescription = null,
-                                            tint = MaterialTheme.colorScheme.primary,
-                                            modifier = Modifier.size(20.dp)
-                                        )
-                                        Spacer(Modifier.width(10.dp))
-                                        Column(modifier = Modifier.weight(1f)) {
-                                            Text(
-                                                text = buildString {
-                                                    append(if (primaryTransfer.isDownload) "Downloading " else "Uploading ")
-                                                    append(primaryTransfer.fileName)
-                                                    if (activeTransfers.size > 1) {
-                                                        append(" (+${activeTransfers.size - 1} more)")
-                                                    }
-                                                },
-                                                style = MaterialTheme.typography.labelLarge,
-                                                fontWeight = FontWeight.SemiBold,
-                                                maxLines = 1,
-                                                overflow = TextOverflow.Ellipsis,
-                                                color = MaterialTheme.colorScheme.onSecondaryContainer
-                                            )
-                                            Text(
-                                                text = "$pct% • Tap to view all transfers",
-                                                style = MaterialTheme.typography.labelSmall,
-                                                color = MaterialTheme.colorScheme.onSecondaryContainer.copy(alpha = 0.75f)
-                                            )
-                                        }
-                                        IconButton(
-                                            onClick = { onCancelTransfer(primaryTransfer.remoteUniqueId) },
-                                            modifier = Modifier.size(28.dp)
-                                        ) {
-                                            Icon(
-                                                imageVector = Icons.Default.Close,
-                                                contentDescription = "Cancel transfer",
-                                                tint = MaterialTheme.colorScheme.onSecondaryContainer,
-                                                modifier = Modifier.size(16.dp)
-                                            )
-                                        }
-                                    }
-                                    Spacer(Modifier.height(6.dp))
-                                    LinearProgressIndicator(
-                                        progress = { primaryTransfer.progress.coerceIn(0f, 1f) },
-                                        modifier = Modifier
-                                            .fillMaxWidth()
-                                            .height(4.dp)
-                                            .clip(RoundedCornerShape(2.dp)),
-                                        color = MaterialTheme.colorScheme.primary,
-                                        trackColor = MaterialTheme.colorScheme.surfaceVariant
-                                    )
-                                }
-                            }
-                        }
-                    }
+                    HomeTransferBanner(activeTransfers, onNavigateToTransfers, onCancelTransfer)
 
                     // Contextual Section Banner for Trash, Recent, or Offline
                     if (currentSection == HomeSection.TRASH) {
@@ -2872,6 +2783,126 @@ fun HomeContent(
     }
 }
 
+@Composable
+private fun DriveOverview(storageUsed: Long, onOpenStorage: () -> Unit) {
+    Surface(
+        onClick = onOpenStorage,
+        modifier = Modifier.fillMaxWidth().padding(top = 12.dp, bottom = 8.dp),
+        shape = RoundedCornerShape(24.dp),
+        color = MaterialTheme.colorScheme.primaryContainer,
+        contentColor = MaterialTheme.colorScheme.onPrimaryContainer
+    ) {
+        Row(
+            modifier = Modifier.padding(start = 20.dp, top = 14.dp, end = 16.dp, bottom = 14.dp),
+            verticalAlignment = Alignment.CenterVertically,
+            horizontalArrangement = Arrangement.spacedBy(12.dp)
+        ) {
+            Column(Modifier.weight(1f), verticalArrangement = Arrangement.spacedBy(4.dp)) {
+                Text(
+                    stringResource(R.string.my_drive),
+                    style = MaterialTheme.typography.headlineSmall,
+                    fontWeight = FontWeight.Bold
+                )
+                Text(
+                    stringResource(R.string.drive_storage_used, formatSize(storageUsed)),
+                    style = MaterialTheme.typography.bodyMedium
+                )
+            }
+            Surface(
+                shape = CircleShape,
+                color = MaterialTheme.colorScheme.surface,
+                contentColor = MaterialTheme.colorScheme.onSurface
+            ) {
+                Icon(Icons.Default.Storage, contentDescription = null, modifier = Modifier.padding(12.dp).size(22.dp))
+            }
+        }
+    }
+}
+
+@Composable
+private fun HomeTransferBanner(
+    transfers: StateFlow<List<TransferInfo>>?,
+    onNavigateToTransfers: () -> Unit,
+    onCancelTransfer: (String) -> Unit
+) {
+    val activeTransfers = transfers?.collectAsState()?.value.orEmpty()
+    AnimatedVisibility(
+        visible = activeTransfers.isNotEmpty(),
+        enter = fadeIn() + slideInVertically(),
+        exit = fadeOut() + slideOutVertically()
+    ) {
+        val primaryTransfer = activeTransfers.firstOrNull()
+        if (primaryTransfer != null) {
+            val pct = (primaryTransfer.progress * 100).toInt().coerceIn(0, 100)
+            Surface(
+                color = MaterialTheme.colorScheme.secondaryContainer.copy(alpha = 0.85f),
+                shape = RoundedCornerShape(14.dp),
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .padding(horizontal = 16.dp, vertical = 4.dp)
+                    .clickable { onNavigateToTransfers() }
+            ) {
+                Column(modifier = Modifier.padding(horizontal = 14.dp, vertical = 10.dp)) {
+                    Row(
+                        verticalAlignment = Alignment.CenterVertically,
+                        modifier = Modifier.fillMaxWidth()
+                    ) {
+                        Icon(
+                            imageVector = if (primaryTransfer.isDownload) Icons.Default.Download else Icons.Default.CloudUpload,
+                            contentDescription = null,
+                            tint = MaterialTheme.colorScheme.primary,
+                            modifier = Modifier.size(20.dp)
+                        )
+                        Spacer(Modifier.width(10.dp))
+                        Column(modifier = Modifier.weight(1f)) {
+                            Text(
+                                text = buildString {
+                                    append(if (primaryTransfer.isDownload) "Downloading " else "Uploading ")
+                                    append(primaryTransfer.fileName)
+                                    if (activeTransfers.size > 1) {
+                                        append(" (+${activeTransfers.size - 1} more)")
+                                    }
+                                },
+                                style = MaterialTheme.typography.labelLarge,
+                                fontWeight = FontWeight.SemiBold,
+                                maxLines = 1,
+                                overflow = TextOverflow.Ellipsis,
+                                color = MaterialTheme.colorScheme.onSecondaryContainer
+                            )
+                            Text(
+                                text = "$pct% • Tap to view all transfers",
+                                style = MaterialTheme.typography.labelSmall,
+                                color = MaterialTheme.colorScheme.onSecondaryContainer.copy(alpha = 0.75f)
+                            )
+                        }
+                        IconButton(
+                            onClick = { onCancelTransfer(primaryTransfer.remoteUniqueId) },
+                            modifier = Modifier.size(28.dp)
+                        ) {
+                            Icon(
+                                imageVector = Icons.Default.Close,
+                                contentDescription = "Cancel transfer",
+                                tint = MaterialTheme.colorScheme.onSecondaryContainer,
+                                modifier = Modifier.size(16.dp)
+                            )
+                        }
+                    }
+                    Spacer(Modifier.height(6.dp))
+                    LinearProgressIndicator(
+                        progress = { primaryTransfer.progress.coerceIn(0f, 1f) },
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .height(4.dp)
+                            .clip(RoundedCornerShape(2.dp)),
+                        color = MaterialTheme.colorScheme.primary,
+                        trackColor = MaterialTheme.colorScheme.surfaceVariant
+                    )
+                }
+            }
+        }
+    }
+}
+
 @Preview(showBackground = true)
 @Composable
 fun HomePreview() {
@@ -2901,7 +2932,6 @@ fun HomePreview() {
             onSetFilterType = { _ -> },
             onCreateFolder = { _, _, _ -> },
             isPasswordSet = true,
-            onSetMasterPassword = {},
             onUploadFile = { _, _, _, _ -> },
             onDeleteItems = { _ -> },
             onMoveItems = { _, _ -> },
